@@ -1,0 +1,1358 @@
+import http from "node:http";
+import crypto from "node:crypto";
+import { spawn } from "node:child_process";
+import { URL } from "node:url";
+import fs from "node:fs";
+import path from "node:path";
+import { dbPath, initSchema, openDatabase, projectDir } from "./db.js";
+import { readMatcherStatus } from "./matcher-core.mjs";
+
+const chainSyncStatusPath = path.join(projectDir, "data", "chain-sync-status.json");
+
+const host = process.env.API_HOST ?? "127.0.0.1";
+const port = Number(process.env.API_PORT ?? "8787");
+const db = openDatabase();
+initSchema(db);
+
+function rows(sql, params = {}) {
+  return db.prepare(sql).all(params).map(parseJsonColumns);
+}
+
+function one(sql, params = {}) {
+  const result = db.prepare(sql).get(params);
+  return result ? parseJsonColumns(result) : null;
+}
+
+function parseJsonColumns(row) {
+  const parsed = { ...row };
+  for (const key of ["raw_json", "args_json"]) {
+    if (typeof parsed[key] === "string") {
+      try {
+        parsed[key] = JSON.parse(parsed[key]);
+      } catch {
+        // Keep original string if it is not valid JSON.
+      }
+    }
+  }
+  return parsed;
+}
+
+function json(res, status, data) {
+  const body = JSON.stringify(data, null, 2);
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "access-control-allow-origin": "*",
+    "cache-control": "no-store",
+  });
+  res.end(body);
+}
+
+function html(res, body) {
+  res.writeHead(200, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  res.end(body);
+}
+
+function notFound(res, pathname) {
+  json(res, 404, {
+    error: "NOT_FOUND",
+    message: `Unknown endpoint: ${pathname}`,
+  });
+}
+
+function badRequest(res, message) {
+  json(res, 400, {
+    error: "BAD_REQUEST",
+    message,
+  });
+}
+
+function internalError(res, error) {
+  json(res, 500, {
+    error: "INTERNAL_ERROR",
+    message: error instanceof Error ? error.message : String(error),
+  });
+}
+
+function readChainSyncStatus() {
+  if (!fs.existsSync(chainSyncStatusPath)) {
+    return {
+      updatedAt: null,
+      running: false,
+      message: "链上事件持续同步服务尚未写入状态",
+    };
+  }
+  return JSON.parse(fs.readFileSync(chainSyncStatusPath, "utf8"));
+}
+
+function limit(url, fallback = 100) {
+  const value = Number(url.searchParams.get("limit") ?? fallback);
+  if (!Number.isInteger(value) || value < 1 || value > 1000) return fallback;
+  return value;
+}
+
+function offset(url) {
+  const value = Number(url.searchParams.get("offset") ?? 0);
+  if (!Number.isInteger(value) || value < 0) return 0;
+  return value;
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk.toString();
+      if (body.length > 1_000_000) {
+        reject(new Error("Request body too large"));
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      if (!body.trim()) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(body));
+      } catch {
+        reject(new Error("Invalid JSON request body"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function requireString(value, name) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`${name} is required`);
+  }
+  return value.trim();
+}
+
+function requireAmountString(value, name) {
+  const text = requireString(String(value ?? ""), name);
+  if (!/^\d+$/.test(text) || BigInt(text) <= 0n) {
+    throw new Error(`${name} must be a positive integer string`);
+  }
+  return text;
+}
+
+function normalizeSide(value) {
+  if (value === 0 || String(value).toUpperCase() === "BUY") return "BUY";
+  if (value === 1 || String(value).toUpperCase() === "SELL") return "SELL";
+  throw new Error("side must be BUY or SELL");
+}
+
+function priceMicrosForOrder(side, makerAmount, takerAmount) {
+  const maker = BigInt(makerAmount);
+  const taker = BigInt(takerAmount);
+  const price = side === "BUY"
+    ? (maker * 1_000_000n) / taker
+    : (taker * 1_000_000n) / maker;
+  if (price <= 0n || price >= 1_000_000n) {
+    throw new Error("price must be between 0 and 1");
+  }
+  return Number(price);
+}
+
+function addAmount(a, b) {
+  return (BigInt(a) + BigInt(b)).toString();
+}
+
+function assertFillWithinOrder(order, nextFilledMaker, nextFilledTaker) {
+  if (BigInt(nextFilledMaker) > BigInt(order.maker_amount)) {
+    throw new Error("filled maker amount exceeds makerAmount");
+  }
+  if (BigInt(nextFilledTaker) > BigInt(order.taker_amount)) {
+    throw new Error("filled taker amount exceeds takerAmount");
+  }
+}
+
+function localOrderId(order) {
+  const raw = JSON.stringify(order);
+  return `local-${crypto.createHash("sha256").update(raw).digest("hex")}`;
+}
+
+function insertOrder(order) {
+  const market = one("SELECT * FROM markets WHERE market_id = :marketId", {
+    marketId: order.marketId,
+  });
+  if (!market) throw new Error(`Unknown marketId: ${order.marketId}`);
+  if (market.status !== "OPEN") throw new Error(`Market is not OPEN: ${market.status}`);
+
+  const side = normalizeSide(order.side);
+  const makerAmount = requireAmountString(order.makerAmount, "makerAmount");
+  const takerAmount = requireAmountString(order.takerAmount, "takerAmount");
+  const normalized = {
+    marketId: requireString(order.marketId, "marketId"),
+    maker: requireString(order.maker, "maker"),
+    signer: requireString(order.signer ?? order.maker, "signer"),
+    side,
+    tokenId: requireString(order.tokenId ?? market.yes_token_id, "tokenId"),
+    makerAmount,
+    takerAmount,
+    expiration: Number(order.expiration ?? 0),
+    salt: String(order.salt ?? Date.now()),
+    signature: typeof order.signature === "string" ? order.signature : null,
+    status: String(order.status ?? "OPEN").toUpperCase(),
+    filledMakerAmount: String(order.filledMakerAmount ?? order.filled_maker_amount ?? "0"),
+    filledTakerAmount: String(order.filledTakerAmount ?? order.filled_taker_amount ?? "0"),
+  };
+  if (!["OPEN", "PARTIALLY_FILLED", "FILLED", "CANCELLED", "EXPIRED", "FAILED"].includes(normalized.status)) {
+    throw new Error("Invalid order status");
+  }
+
+  const id = typeof order.localOrderId === "string" && order.localOrderId.trim()
+    ? order.localOrderId.trim()
+    : localOrderId(normalized);
+  const priceMicros = priceMicrosForOrder(side, makerAmount, takerAmount);
+  if (!/^\d+$/.test(normalized.filledMakerAmount) || !/^\d+$/.test(normalized.filledTakerAmount)) {
+    throw new Error("filled amounts must be integer strings");
+  }
+  assertFillWithinOrder(
+    { maker_amount: makerAmount, taker_amount: takerAmount },
+    normalized.filledMakerAmount,
+    normalized.filledTakerAmount,
+  );
+
+  db.prepare(
+    `INSERT INTO orders(
+       chain_id, local_order_id, market_id, maker, signer, side, token_id,
+       maker_amount, taker_amount, filled_maker_amount, filled_taker_amount,
+       price_micros, status, expiration, salt, signature, raw_json, updated_at
+     )
+     VALUES(
+       :chainId, :localOrderId, :marketId, :maker, :signer, :side, :tokenId,
+       :makerAmount, :takerAmount, :filledMakerAmount, :filledTakerAmount,
+       :priceMicros, :status, :expiration, :salt, :signature, :rawJson, CURRENT_TIMESTAMP
+     )
+     ON CONFLICT(chain_id, local_order_id) DO UPDATE SET
+       market_id=excluded.market_id,
+       maker=excluded.maker,
+       signer=excluded.signer,
+       side=excluded.side,
+       token_id=excluded.token_id,
+       maker_amount=excluded.maker_amount,
+       taker_amount=excluded.taker_amount,
+       filled_maker_amount=excluded.filled_maker_amount,
+       filled_taker_amount=excluded.filled_taker_amount,
+       price_micros=excluded.price_micros,
+       status=excluded.status,
+       expiration=excluded.expiration,
+       salt=excluded.salt,
+       signature=excluded.signature,
+       raw_json=excluded.raw_json,
+       updated_at=excluded.updated_at`,
+  ).run({
+    chainId: market.chain_id,
+    localOrderId: id,
+    marketId: normalized.marketId,
+    maker: normalized.maker,
+    signer: normalized.signer,
+    side: normalized.side,
+    tokenId: normalized.tokenId,
+    makerAmount: normalized.makerAmount,
+    takerAmount: normalized.takerAmount,
+    filledMakerAmount: normalized.filledMakerAmount,
+    filledTakerAmount: normalized.filledTakerAmount,
+    priceMicros,
+    status: normalized.status,
+    expiration: normalized.expiration,
+    salt: normalized.salt,
+    signature: normalized.signature,
+    rawJson: JSON.stringify(normalized),
+  });
+
+  return one("SELECT * FROM orders WHERE local_order_id = :id", { id });
+}
+
+function orderById(localOrderId) {
+  return one("SELECT * FROM orders WHERE local_order_id = :localOrderId", { localOrderId });
+}
+
+function cancelOrder(localOrderId) {
+  const order = orderById(localOrderId);
+  if (!order) throw new Error(`Unknown order: ${localOrderId}`);
+  if (!["OPEN", "PARTIALLY_FILLED"].includes(order.status)) {
+    throw new Error(`Only OPEN/PARTIALLY_FILLED orders can be cancelled. Current: ${order.status}`);
+  }
+  db.prepare(
+    `UPDATE orders
+     SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP
+     WHERE local_order_id = :localOrderId`,
+  ).run({ localOrderId });
+  return orderById(localOrderId);
+}
+
+function fillOrder(localOrderId, body) {
+  const order = orderById(localOrderId);
+  if (!order) throw new Error(`Unknown order: ${localOrderId}`);
+  if (!["OPEN", "PARTIALLY_FILLED"].includes(order.status)) {
+    throw new Error(`Only OPEN/PARTIALLY_FILLED orders can be filled. Current: ${order.status}`);
+  }
+  const makerFill = requireAmountString(body.makerFillAmount ?? body.filledMakerAmount, "makerFillAmount");
+  const takerFill = requireAmountString(body.takerFillAmount ?? body.filledTakerAmount, "takerFillAmount");
+  const nextFilledMaker = addAmount(order.filled_maker_amount ?? "0", makerFill);
+  const nextFilledTaker = addAmount(order.filled_taker_amount ?? "0", takerFill);
+  assertFillWithinOrder(order, nextFilledMaker, nextFilledTaker);
+  const nextStatus =
+    BigInt(nextFilledMaker) === BigInt(order.maker_amount) ||
+    BigInt(nextFilledTaker) === BigInt(order.taker_amount)
+      ? "FILLED"
+      : "PARTIALLY_FILLED";
+
+  db.prepare(
+    `UPDATE orders
+     SET filled_maker_amount = :filledMakerAmount,
+         filled_taker_amount = :filledTakerAmount,
+         status = :status,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE local_order_id = :localOrderId`,
+  ).run({
+    localOrderId,
+    filledMakerAmount: nextFilledMaker,
+    filledTakerAmount: nextFilledTaker,
+    status: nextStatus,
+  });
+  return orderById(localOrderId);
+}
+
+function runCommand(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env,
+      shell: false,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(new Error(stderr || stdout || `Command failed with code ${code}`));
+      }
+    });
+  });
+}
+
+async function cancelOrderOnchain(localOrderId, body = {}) {
+  if (body.confirmation !== "AMOY_TESTNET_ONLY") {
+    throw new Error("链上取消需要 confirmation=AMOY_TESTNET_ONLY");
+  }
+  const before = orderById(localOrderId);
+  if (!before) throw new Error(`Unknown order: ${localOrderId}`);
+  if (!before.signature) throw new Error(`Order has no signature: ${localOrderId}`);
+
+  const result = await runCommand(
+    "node",
+    ["scripts/cancel-research-order.mjs", localOrderId],
+    {
+      cwd: new URL("..", import.meta.url).pathname,
+      env: {
+        ...process.env,
+        LIVE_ACTION: "CANCEL_RESEARCH_ORDER",
+        LIVE_CONFIRMATION: "AMOY_TESTNET_ONLY",
+      },
+    },
+  );
+  return {
+    order: orderById(localOrderId),
+    stdout: result.stdout.trim(),
+    stderr: result.stderr.trim(),
+  };
+}
+
+async function seedSignedOrders() {
+  const result = await runCommand("node", ["scripts/seed-signed-orders.mjs"], {
+    cwd: new URL("..", import.meta.url).pathname,
+    env: process.env,
+  });
+  const match = result.stdout.match(/\{[\s\S]*\}/);
+  const created = match ? JSON.parse(match[0]) : null;
+  return {
+    created,
+    stdout: result.stdout.trim(),
+    stderr: result.stderr.trim(),
+    recentOrders: rows(
+      "SELECT local_order_id, side, price_micros, status, updated_at FROM orders ORDER BY updated_at DESC LIMIT 6",
+    ),
+  };
+}
+
+async function matchOrdersOnchain(body = {}) {
+  if (body.confirmation !== "AMOY_TESTNET_ONLY") {
+    throw new Error("链上撮合需要 confirmation=AMOY_TESTNET_ONLY");
+  }
+  const projectDir = new URL("..", import.meta.url).pathname;
+  const match = await runCommand("node", ["scripts/match-research-orders.mjs"], {
+    cwd: projectDir,
+    env: {
+      ...process.env,
+      LIVE_ACTION: "MATCH_RESEARCH_ORDERS",
+      LIVE_CONFIRMATION: "AMOY_TESTNET_ONLY",
+    },
+  });
+  const syncEvents = await runCommand("node", ["scripts/db-sync-events.mjs"], {
+    cwd: projectDir,
+    env: process.env,
+  });
+  const syncBalances = await runCommand("node", ["scripts/db-sync-balances.mjs"], {
+    cwd: projectDir,
+    env: process.env,
+  });
+  return {
+    stdout: [match.stdout, syncEvents.stdout, syncBalances.stdout].map((item) => item.trim()).filter(Boolean).join("\n\n"),
+    stderr: [match.stderr, syncEvents.stderr, syncBalances.stderr].map((item) => item.trim()).filter(Boolean).join("\n\n"),
+    orderbook: routes["/api/orderbook"](new URL("http://local/api/orderbook")),
+    trades: routes["/api/trades"](new URL("http://local/api/trades?limit=5")),
+  };
+}
+
+async function syncDatabaseFromChain() {
+  const projectDir = new URL("..", import.meta.url).pathname;
+  const syncEvents = await runCommand("node", ["scripts/db-sync-events.mjs"], {
+    cwd: projectDir,
+    env: process.env,
+  });
+  const syncBalances = await runCommand("node", ["scripts/db-sync-balances.mjs"], {
+    cwd: projectDir,
+    env: process.env,
+  });
+  return {
+    stdout: [syncEvents.stdout, syncBalances.stdout].map((item) => item.trim()).filter(Boolean).join("\n\n"),
+    stderr: [syncEvents.stderr, syncBalances.stderr].map((item) => item.trim()).filter(Boolean).join("\n\n"),
+    summary: routes["/api/summary"](),
+  };
+}
+
+function indexPage() {
+  const summary = {
+    contracts: one("SELECT COUNT(*) AS count FROM contracts").count,
+    wallets: one("SELECT COUNT(*) AS count FROM wallets").count,
+    markets: one("SELECT COUNT(*) AS count FROM markets").count,
+    orders: one("SELECT COUNT(*) AS count FROM orders").count,
+    trades: one("SELECT COUNT(*) AS count FROM trades").count,
+    balances: one("SELECT COUNT(*) AS count FROM token_balances").count,
+    events: one("SELECT COUNT(*) AS count FROM chain_events").count,
+  };
+
+  const links = [
+    ["/dashboard", "可视化 Dashboard"],
+    ["/trade", "下单页面"],
+    ["/api/summary", "摘要"],
+    ["/api/contracts", "合约地址"],
+    ["/api/wallets", "Deposit Wallet"],
+    ["/api/markets", "市场"],
+    ["/api/orders", "订单"],
+    ["/api/markets/:id/orderbook", "指定市场订单簿"],
+    ["/api/orderbook", "订单簿"],
+    ["/api/trades", "成交"],
+    ["/api/balances", "余额"],
+    ["/api/events", "链上事件"],
+    ["/api/matcher/status", "自动撮合状态"],
+    ["/api/chain-sync/status", "链上持续同步状态"],
+  ];
+
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Research Polymarket API</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 36px; color: #17212b; }
+    h1 { color: #0d47a1; }
+    code { background: #f6f8fa; padding: 2px 6px; border-radius: 4px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; max-width: 920px; }
+    .card { border: 1px solid #d0d7de; border-radius: 10px; padding: 14px; background: #fff; }
+    .count { font-size: 28px; font-weight: 700; color: #1565c0; }
+    a { color: #1565c0; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    li { margin: 8px 0; }
+  </style>
+</head>
+<body>
+  <h1>Research Polymarket 数据 API</h1>
+  <p>数据库：<code>${dbPath}</code></p>
+  <div class="grid">
+    ${Object.entries(summary).map(([key, value]) => `<div class="card"><div>${key}</div><div class="count">${value}</div></div>`).join("")}
+  </div>
+  <h2>浏览器查看入口</h2>
+  <ul>
+    ${links.map(([href, label]) => `<li><a href="${href}">${label}</a> <code>${href}</code></li>`).join("")}
+  </ul>
+  <h2>常用筛选</h2>
+  <ul>
+    <li><code>/api/events?eventName=TradeExecuted</code></li>
+    <li><code>/api/orders?status=FILLED</code></li>
+    <li><code>/api/orderbook?marketId=0x2b51dd486618b7916d54d258f84332f888934ba546dd37171cea2a25e14b3691</code></li>
+    <li><code>/api/markets/0x2b51dd486618b7916d54d258f84332f888934ba546dd37171cea2a25e14b3691/orderbook</code></li>
+    <li><code>/api/balances?wallet=0xb2E67683d5C3a3EA40ebB343F87AE3E46a1aC8D7</code></li>
+  </ul>
+</body>
+</html>`;
+}
+
+function tradePage() {
+  const markets = routes["/api/markets"]();
+  const wallets = routes["/api/wallets"]();
+  const market = markets[0];
+  const buyer = wallets.find((wallet) => wallet.wallet_role === "buyer")?.wallet_address ?? "";
+  const seller = wallets.find((wallet) => wallet.wallet_role === "seller")?.wallet_address ?? "";
+  const orderbookPath = market ? `/api/markets/${market.market_id}/orderbook` : "/api/orderbook";
+  const marketOptions = markets.map((item) =>
+    `<option value="${escapeHtml(item.market_id)}">${escapeHtml(item.question)} · ${escapeHtml(short(item.market_id, 8))}</option>`,
+  ).join("");
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Research Polymarket 交易控制台</title>
+  <style>
+    :root { color-scheme: light; --blue:#1565c0; --deep:#0d47a1; --line:#dfe5ec; --muted:#667085; --bg:#f5f7fb; --danger:#b42318; --green:#1b5e20; --orange:#8a4b00; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: var(--bg); color: #17212b; }
+    header { background: linear-gradient(135deg, #0d47a1, #1565c0); color: white; padding: 26px 32px; }
+    main { max-width: 1360px; margin: 0 auto; padding: 24px 30px 46px; }
+    h1 { margin: 0 0 8px; }
+    h2 { color: var(--deep); margin: 0 0 12px; font-size: 18px; }
+    h3 { margin: 14px 0 8px; color: #344054; font-size: 15px; }
+    label { display: block; margin-top: 12px; font-weight: 650; }
+    input, select, textarea { width: 100%; box-sizing: border-box; padding: 9px 10px; border: 1px solid #ccd5df; border-radius: 8px; font-family: Consolas, "Microsoft YaHei", monospace; }
+    button { margin: 8px 8px 0 0; padding: 10px 14px; border: 0; border-radius: 8px; background: #1565c0; color: white; font-weight: 700; cursor: pointer; }
+    button:hover { background: #0d47a1; }
+    button.warn { background: #b42318; }
+    button.warn:hover { background: #7a271a; }
+    button.secondary { background: #475467; }
+    button.secondary:hover { background: #344054; }
+    button.mini { padding: 6px 9px; font-size: 12px; margin: 0 4px 4px 0; }
+    code, pre { background: #f6f8fa; padding: 2px 6px; border-radius: 4px; }
+    pre { padding: 12px; white-space: pre-wrap; overflow: auto; max-height: 360px; }
+    .topline { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; align-items: center; }
+    header a { color: white; border: 1px solid rgba(255,255,255,.5); padding: 6px 10px; border-radius: 999px; text-decoration: none; }
+    header a:hover { background: rgba(255,255,255,.12); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+    .layout { display: grid; grid-template-columns: minmax(320px, 420px) 1fr; gap: 16px; align-items: start; }
+    @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } }
+    .card { background: white; border: 1px solid #dfe5ec; border-radius: 12px; padding: 16px; box-shadow: 0 1px 2px rgba(16,24,40,.04); }
+    .card + .card { margin-top: 14px; }
+    .muted { color: #667085; }
+    .small { font-size: 12px; }
+    .mono { font-family: Consolas, "Microsoft YaHei", monospace; }
+    .metric { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 16px 0; }
+    .metric .card { margin: 0; }
+    .label { color: var(--muted); font-size: 12px; }
+    .value { font-weight: 800; font-size: 18px; color: var(--blue); margin-top: 4px; word-break: break-all; }
+    table { border-collapse: collapse; width: 100%; background: white; }
+    th, td { padding: 9px 10px; border-bottom: 1px solid #edf1f5; text-align: left; font-size: 13px; vertical-align: top; }
+    th { background: #f8fafc; }
+    .table-wrap { overflow-x: auto; border: 1px solid #dfe5ec; border-radius: 12px; }
+    .status { margin-top: 12px; padding: 10px 12px; background: #eef4ff; border: 1px solid #b2ccff; border-radius: 8px; color: #1849a9; font-weight: 650; }
+    .status.error { background: #fff1f3; border-color: #fda29b; color: #b42318; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #e3f2fd; color: var(--deep); font-weight: 700; font-size: 12px; }
+    .pill.green { background: #e8f5e9; color: var(--green); }
+    .pill.orange { background: #fff4e5; color: var(--orange); }
+    .pill.red { background: #fff1f3; color: var(--danger); }
+    .section { margin-top: 16px; }
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    @media (max-width: 760px) { .split { grid-template-columns: 1fr; } }
+    .right { text-align: right; }
+    .nowrap { white-space: nowrap; }
+    button:disabled { opacity: .6; cursor: wait; }
+    a { color: #1565c0; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Research Polymarket 交易页面</h1>
+    <div>市场、订单簿、签名订单、链上撮合、取消订单和余额监控。</div>
+    <div class="topline">
+      <a href="/dashboard">Dashboard</a>
+      <a href="${escapeHtml(orderbookPath)}">订单簿 JSON</a>
+      <a href="/api/matcher/status">撮合服务状态</a>
+      <a href="/api/chain-sync/status">链上同步状态</a>
+      <a href="/api/events?eventName=OrdersMatched">撮合事件</a>
+      <a href="/api/events?eventName=OrderCancelled">取消事件</a>
+    </div>
+  </header>
+
+  <main>
+  <section class="metric">
+    <div class="card"><div class="label">当前市场</div><div class="value" id="metric-market">加载中</div></div>
+    <div class="card"><div class="label">买方钱包</div><div class="value mono" id="metric-buyer">${escapeHtml(short(buyer, 8))}</div></div>
+    <div class="card"><div class="label">卖方钱包</div><div class="value mono" id="metric-seller">${escapeHtml(short(seller, 8))}</div></div>
+    <div class="card"><div class="label">自动撮合</div><div class="value" id="metric-matcher">加载中</div></div>
+    <div class="card"><div class="label">链上同步</div><div class="value" id="metric-chain-sync">加载中</div></div>
+  </section>
+
+  <section class="layout">
+    <div>
+      <div class="card">
+        <h2>市场选择</h2>
+        <label>Market</label>
+        <select id="market-select">${marketOptions}</select>
+        <div class="status" id="market-info">加载市场信息...</div>
+        <div class="topline">
+          <label><input id="auto-refresh" type="checkbox" checked style="width:auto" /> 自动刷新 5 秒</label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>快捷操作</h2>
+        <p class="muted small">生成签名订单只写数据库；链上撮合/取消会发 Amoy 测试网交易。</p>
+        <button id="seed-signed" type="button">生成签名订单</button>
+        <button id="match-chain" type="button" class="warn">撮合一轮</button>
+        <button id="sync-db" type="button" class="secondary">同步事件/余额</button>
+        <div id="action-status" class="status">等待操作</div>
+      </div>
+
+      <div class="card">
+        <h2>提交订单到数据库</h2>
+        <div>
+          <button id="preset-buy" type="button" class="secondary">填入 BUY 示例</button>
+          <button id="preset-sell" type="button" class="secondary">填入 SELL 示例</button>
+        </div>
+        <form id="order-form">
+          <label>Market ID</label>
+          <input name="marketId" value="${escapeHtml(market?.market_id ?? "")}" required />
+          <div class="grid">
+            <div>
+              <label>方向</label>
+              <select name="side">
+                <option value="BUY">BUY 买入 YES</option>
+                <option value="SELL">SELL 卖出 YES</option>
+              </select>
+            </div>
+            <div>
+              <label>Token</label>
+              <select id="token-kind">
+                <option value="YES">YES</option>
+                <option value="NO">NO</option>
+              </select>
+            </div>
+          </div>
+          <label>Maker</label>
+          <input name="maker" value="${escapeHtml(buyer)}" required />
+          <label>Signer</label>
+          <input name="signer" value="${escapeHtml(buyer)}" required />
+          <label>Token ID</label>
+          <input name="tokenId" value="${escapeHtml(market?.yes_token_id ?? "")}" required />
+          <div class="grid">
+            <div>
+              <label>makerAmount</label>
+              <input name="makerAmount" value="600000" required />
+            </div>
+            <div>
+              <label>takerAmount</label>
+              <input name="takerAmount" value="1000000" required />
+            </div>
+          </div>
+          <div class="grid">
+            <div>
+              <label>expiration</label>
+              <input name="expiration" value="0" />
+            </div>
+            <div>
+              <label>salt</label>
+              <input name="salt" value="${Date.now()}" />
+            </div>
+          </div>
+          <label>signature（可选；无签名订单不能链上撮合）</label>
+          <input name="signature" value="" />
+          <button type="submit">提交订单</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>链上取消订单</h2>
+        <label>local_order_id</label>
+        <input id="cancel-id" placeholder="点击订单行可自动填入" />
+        <button id="cancel-chain" type="button" class="warn">链上取消</button>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <h2>余额</h2>
+        <div class="table-wrap"><table id="balances-table"><thead><tr><th>钱包</th><th>资产</th><th>Token ID</th><th class="right">余额</th></tr></thead><tbody></tbody></table></div>
+      </div>
+
+      <div class="card section">
+        <h2>订单簿</h2>
+        <div class="split">
+          <div>
+            <h3>Bids 买单</h3>
+            <div class="table-wrap"><table id="bids-table"><thead><tr><th>价格</th><th class="right">数量</th><th class="right">订单</th></tr></thead><tbody></tbody></table></div>
+          </div>
+          <div>
+            <h3>Asks 卖单</h3>
+            <div class="table-wrap"><table id="asks-table"><thead><tr><th>价格</th><th class="right">数量</th><th class="right">订单</th></tr></thead><tbody></tbody></table></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card section">
+        <h2>最近订单</h2>
+        <div class="table-wrap"><table id="orders-table"><thead><tr><th>ID</th><th>方向</th><th>价格</th><th>成交进度</th><th>状态</th><th>签名</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+      </div>
+
+      <div class="card section">
+        <h2>最近成交</h2>
+        <div class="table-wrap"><table id="trades-table"><thead><tr><th>Tx</th><th>Buyer</th><th>Seller</th><th class="right">YES/NO</th><th class="right">rWALLET</th></tr></thead><tbody></tbody></table></div>
+      </div>
+
+      <div class="card section">
+        <h2>执行结果</h2>
+        <pre id="result">等待操作...</pre>
+      </div>
+    </div>
+  </section>
+  </main>
+  <script>
+    const markets = ${JSON.stringify(markets)};
+    const buyerWallet = "${escapeHtml(buyer)}";
+    const sellerWallet = "${escapeHtml(seller)}";
+    const form = document.querySelector("#order-form");
+    const result = document.querySelector("#result");
+    const marketSelect = document.querySelector("#market-select");
+    const tokenKind = document.querySelector("#token-kind");
+    const marketInfo = document.querySelector("#market-info");
+    const bidsBody = document.querySelector("#bids-table tbody");
+    const asksBody = document.querySelector("#asks-table tbody");
+    const ordersBody = document.querySelector("#orders-table tbody");
+    const tradesBody = document.querySelector("#trades-table tbody");
+    const balancesBody = document.querySelector("#balances-table tbody");
+    const actionStatus = document.querySelector("#action-status");
+    const actionButtons = Array.from(document.querySelectorAll("button"));
+
+    function shortText(value, size = 8) {
+      const text = String(value || "");
+      return text.length <= size * 2 + 3 ? text : text.slice(0, size) + "..." + text.slice(-size);
+    }
+
+    function activeMarket() {
+      return markets.find((item) => item.market_id === marketSelect.value) || markets[0] || {};
+    }
+
+    function tokenIdFor(kind) {
+      const market = activeMarket();
+      return kind === "NO" ? market.no_token_id : market.yes_token_id;
+    }
+
+    function setTokenFromKind() {
+      form.elements.tokenId.value = tokenIdFor(tokenKind.value) || "";
+    }
+
+    function setPreset(side) {
+      const market = activeMarket();
+      form.elements.marketId.value = market.market_id || "";
+      form.elements.side.value = side;
+      tokenKind.value = "YES";
+      form.elements.tokenId.value = market.yes_token_id || "";
+      form.elements.salt.value = String(Date.now());
+      form.elements.signature.value = "";
+      if (side === "BUY") {
+        form.elements.maker.value = buyerWallet;
+        form.elements.signer.value = buyerWallet;
+        form.elements.makerAmount.value = "600000";
+        form.elements.takerAmount.value = "1000000";
+      } else {
+        form.elements.maker.value = sellerWallet;
+        form.elements.signer.value = sellerWallet;
+        form.elements.makerAmount.value = "1000000";
+        form.elements.takerAmount.value = "560000";
+      }
+    }
+
+    function statusPill(status) {
+      const s = String(status || "");
+      const cls = s === "OPEN" ? "green" : s === "PARTIALLY_FILLED" ? "orange" : s === "CANCELLED" || s === "FAILED" ? "red" : "";
+      return '<span class="pill ' + cls + '">' + s + '</span>';
+    }
+
+    function sidePill(side) {
+      return '<span class="pill ' + (side === "BUY" ? "green" : "orange") + '">' + side + '</span>';
+    }
+
+    function emptyRow(cols, text) {
+      return '<tr><td colspan="' + cols + '" class="muted">' + text + '</td></tr>';
+    }
+
+    async function postJson(url, body = {}) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const json = await response.json();
+      if (!response.ok || json.error) throw new Error(JSON.stringify(json, null, 2));
+      return json;
+    }
+
+    async function refresh() {
+      const market = activeMarket();
+      const marketId = encodeURIComponent(market.market_id || "");
+      const [book, orders, trades, balances, matcher, chainSync] = await Promise.all([
+        fetch("/api/orderbook?marketId=" + marketId).then((r) => r.json()),
+        fetch("/api/orders?marketId=" + marketId + "&limit=30").then((r) => r.json()),
+        fetch("/api/trades?marketId=" + marketId + "&limit=20").then((r) => r.json()),
+        fetch("/api/balances").then((r) => r.json()),
+        fetch("/api/matcher/status").then((r) => r.json()),
+        fetch("/api/chain-sync/status").then((r) => r.json()),
+      ]);
+      document.querySelector("#metric-market").textContent = shortText(market.market_id || "无市场", 8);
+      document.querySelector("#metric-matcher").textContent = matcher.running ? "运行中" : "未运行";
+      document.querySelector("#metric-chain-sync").textContent = chainSync.running ? "运行中" : "未运行";
+      marketInfo.innerHTML = '<div><b>' + (market.question || "无市场") + '</b></div>'
+        + '<div class="small muted">状态：' + (market.status || "-") + ' · YES ' + shortText(market.yes_token_id, 10) + ' · NO ' + shortText(market.no_token_id, 10) + '</div>'
+        + '<div class="small muted">撮合状态：' + (matcher.mode || "-") + ' · 最近 ' + (matcher.updatedAt || "-") + '</div>'
+        + '<div class="small muted">链上同步：' + (chainSync.running ? "运行中" : "未运行") + ' · 最近 ' + (chainSync.updatedAt || "-") + '</div>';
+
+      bidsBody.innerHTML = book.bids?.length ? book.bids.map((item) =>
+        '<tr><td>' + item.price_micros + '</td><td class="right">' + item.total_size + '</td><td class="right">' + item.order_count + '</td></tr>'
+      ).join("") : emptyRow(3, "暂无买单");
+      asksBody.innerHTML = book.asks?.length ? book.asks.map((item) =>
+        '<tr><td>' + item.price_micros + '</td><td class="right">' + item.total_size + '</td><td class="right">' + item.order_count + '</td></tr>'
+      ).join("") : emptyRow(3, "暂无卖单");
+
+      ordersBody.innerHTML = orders.map((item) => {
+        const filled = item.filled_maker_amount + "/" + item.maker_amount + " | " + item.filled_taker_amount + "/" + item.taker_amount;
+        const signature = item.signature ? "yes" : "no";
+        const canCancel = (item.status === "OPEN" || item.status === "PARTIALLY_FILLED") && item.signature;
+        const cancelButton = canCancel ? '<button class="mini warn cancel-row" data-id="' + item.local_order_id + '">取消</button>' : '';
+        const copyButton = '<button class="mini secondary use-row" data-id="' + item.local_order_id + '">选中</button>';
+        return "<tr><td><code>" + item.local_order_id + "</code></td><td>" + sidePill(item.side) + "</td><td>" + item.price_micros + "</td><td>" + filled + "</td><td>" + statusPill(item.status) + "</td><td>" + signature + "</td><td class='nowrap'>" + copyButton + cancelButton + "</td></tr>";
+      }).join("") || emptyRow(7, "暂无订单");
+
+      tradesBody.innerHTML = trades.map((item) =>
+        '<tr><td><a target="_blank" rel="noreferrer" href="https://amoy.polygonscan.com/tx/' + item.tx_hash + '">' + shortText(item.tx_hash, 8) + '</a></td><td class="mono">' + shortText(item.buyer, 8) + '</td><td class="mono">' + shortText(item.seller, 8) + '</td><td class="right">' + item.outcome_amount + '</td><td class="right">' + item.collateral_amount + '</td></tr>'
+      ).join("") || emptyRow(5, "暂无成交");
+
+      balancesBody.innerHTML = balances.map((item) =>
+        '<tr><td class="mono">' + shortText(item.wallet_address, 8) + '</td><td>' + item.token_symbol + '</td><td class="mono">' + shortText(item.token_id, 8) + '</td><td class="right">' + item.balance_decimal + '</td></tr>'
+      ).join("") || emptyRow(4, "暂无余额");
+    }
+
+    async function runAction(label, fn) {
+      actionStatus.className = "status";
+      actionStatus.textContent = label + " 执行中...";
+      result.textContent = label + " 执行中...";
+      actionButtons.forEach((button) => { button.disabled = true; });
+      try {
+        const json = await fn();
+        actionStatus.className = "status";
+        actionStatus.textContent = label + " 完成";
+        result.textContent = JSON.stringify(json, null, 2);
+        await refresh();
+      } catch (error) {
+        actionStatus.className = "status error";
+        actionStatus.textContent = label + " 失败，详情见下方结果区域";
+        result.textContent = String(error);
+      } finally {
+        actionButtons.forEach((button) => { button.disabled = false; });
+      }
+    }
+
+    document.querySelector("#seed-signed").addEventListener("click", () => {
+      runAction("生成签名订单", () => postJson("/api/orders/seed-signed"));
+    });
+    document.querySelector("#match-chain").addEventListener("click", () => {
+      if (!confirm("确认在 Amoy 测试网上发起链上撮合交易？")) return;
+      runAction("链上撮合", () => postJson("/api/orders/match-chain", { confirmation: "AMOY_TESTNET_ONLY" }));
+    });
+    document.querySelector("#sync-db").addEventListener("click", () => {
+      runAction("同步事件/余额", () => postJson("/api/sync"));
+    });
+    document.querySelector("#cancel-chain").addEventListener("click", () => {
+      const id = document.querySelector("#cancel-id").value.trim();
+      if (!id) return alert("请输入 local_order_id");
+      if (!confirm("确认在 Amoy 测试网上链上取消订单 " + id + "？")) return;
+      runAction("链上取消", () => postJson("/api/orders/" + encodeURIComponent(id) + "/cancel-chain", { confirmation: "AMOY_TESTNET_ONLY" }));
+    });
+    document.querySelector("#preset-buy").addEventListener("click", () => setPreset("BUY"));
+    document.querySelector("#preset-sell").addEventListener("click", () => setPreset("SELL"));
+    marketSelect.addEventListener("change", () => {
+      form.elements.marketId.value = activeMarket().market_id || "";
+      setTokenFromKind();
+      refresh().catch((error) => { result.textContent = String(error); });
+    });
+    tokenKind.addEventListener("change", setTokenFromKind);
+    ordersBody.addEventListener("click", (event) => {
+      const target = event.target;
+      if (!target?.dataset?.id) return;
+      document.querySelector("#cancel-id").value = target.dataset.id;
+      if (target.classList.contains("cancel-row")) {
+        document.querySelector("#cancel-chain").click();
+      }
+    });
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(form).entries());
+      if (!data.signature) delete data.signature;
+      runAction("提交数据库订单", () => postJson("/api/orders", data));
+    });
+    setPreset("BUY");
+    refresh().catch((error) => { result.textContent = String(error); });
+    setInterval(() => {
+      if (document.querySelector("#auto-refresh").checked) {
+        refresh().catch((error) => { result.textContent = String(error); });
+      }
+    }, 5000);
+  </script>
+</body>
+</html>`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function short(value, size = 10) {
+  const text = String(value ?? "");
+  if (text.length <= size * 2 + 3) return text;
+  return `${text.slice(0, size)}...${text.slice(-size)}`;
+}
+
+function explorerTx(hash) {
+  if (!hash || hash === "already-approved") return escapeHtml(hash ?? "");
+  return `<a href="https://amoy.polygonscan.com/tx/${escapeHtml(hash)}" target="_blank" rel="noreferrer">${escapeHtml(short(hash, 8))}</a>`;
+}
+
+function explorerAddress(address) {
+  if (!address || !String(address).startsWith("0x")) return escapeHtml(address ?? "");
+  return `<a href="https://amoy.polygonscan.com/address/${escapeHtml(address)}" target="_blank" rel="noreferrer">${escapeHtml(short(address, 8))}</a>`;
+}
+
+function tableHtml(headers, tableRows) {
+  return `<div class="table-wrap"><table>
+    <thead><tr>${headers.map((header) => `<th>${escapeHtml(header)}</th>`).join("")}</tr></thead>
+    <tbody>
+      ${tableRows.length
+        ? tableRows.map((row) => `<tr>${row.map((value) => `<td>${value}</td>`).join("")}</tr>`).join("")
+        : `<tr><td colspan="${headers.length}" class="muted">暂无数据</td></tr>`}
+    </tbody>
+  </table></div>`;
+}
+
+function dashboardPage() {
+  const summary = routes["/api/summary"]();
+  const contracts = routes["/api/contracts"]();
+  const wallets = routes["/api/wallets"]();
+  const markets = routes["/api/markets"]();
+  const orders = rows("SELECT * FROM orders ORDER BY updated_at DESC LIMIT 50");
+  const firstMarketId = markets[0]?.market_id;
+  const orderbook = firstMarketId
+    ? orderbookForMarket(firstMarketId)
+    : { marketId: null, bids: [], asks: [] };
+  const trades = rows("SELECT * FROM trades ORDER BY created_at DESC LIMIT 50");
+  const balances = routes["/api/balances"](new URL("http://local/api/balances"));
+  const events = rows(
+    "SELECT * FROM chain_events ORDER BY block_number DESC, log_index DESC LIMIT 50",
+  );
+
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Research Polymarket Dashboard</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #f5f7fb; color: #17212b; }
+    header { background: linear-gradient(135deg, #0d47a1, #1565c0); color: white; padding: 28px 36px; }
+    main { padding: 24px 36px 48px; }
+    h1 { margin: 0 0 8px; }
+    h2 { margin-top: 30px; color: #0d47a1; }
+    a { color: #1565c0; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code { background: #eef2f7; padding: 2px 6px; border-radius: 4px; }
+    .sub { opacity: .9; }
+    .nav { margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; }
+    .nav a { color: white; border: 1px solid rgba(255,255,255,.45); padding: 6px 10px; border-radius: 999px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 18px; }
+    .card { background: white; border: 1px solid #dfe5ec; border-radius: 12px; padding: 14px; box-shadow: 0 1px 2px rgba(16,24,40,.04); }
+    .label { color: #5b6777; font-size: 13px; }
+    .count { font-size: 28px; font-weight: 750; color: #1565c0; margin-top: 4px; }
+    .table-wrap { overflow-x: auto; background: white; border: 1px solid #dfe5ec; border-radius: 12px; box-shadow: 0 1px 2px rgba(16,24,40,.04); }
+    table { border-collapse: collapse; width: 100%; min-width: 860px; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #edf1f5; text-align: left; font-size: 13px; vertical-align: top; }
+    th { background: #f8fafc; color: #455468; position: sticky; top: 0; }
+    tr:last-child td { border-bottom: none; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #e3f2fd; color: #0d47a1; font-weight: 650; }
+    .pill.green { background: #e8f5e9; color: #1b5e20; }
+    .pill.orange { background: #fff4e5; color: #8a4b00; }
+    .muted { color: #667085; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Research Polymarket Dashboard</h1>
+    <div class="sub">浏览 SQLite 数据库与 Amoy 链上同步事件</div>
+    <div class="sub">数据库：<code>${escapeHtml(dbPath)}</code></div>
+    <div class="nav">
+      <a href="/">API 首页</a>
+      <a href="/api/summary">JSON 摘要</a>
+      <a href="/trade">下单页面</a>
+      <a href="/api/orderbook${firstMarketId ? `?marketId=${escapeHtml(firstMarketId)}` : ""}">订单簿 JSON</a>
+      <a href="/api/events?eventName=TradeExecuted">TradeExecuted JSON</a>
+      <a href="/api/matcher/status">自动撮合状态</a>
+      <a href="https://amoy.polygonscan.com/" target="_blank" rel="noreferrer">Amoy Polygonscan</a>
+    </div>
+  </header>
+  <main>
+    <section class="cards">
+      ${Object.entries(summary.counts).map(([key, value]) => `<div class="card"><div class="label">${escapeHtml(key)}</div><div class="count">${escapeHtml(value)}</div></div>`).join("")}
+    </section>
+
+    <h2>合约</h2>
+    ${tableHtml(["名称", "角色", "地址", "备注"], contracts.map((item) => [
+      escapeHtml(item.name),
+      escapeHtml(item.role),
+      explorerAddress(item.address),
+      escapeHtml(item.notes),
+    ]))}
+
+    <h2>Deposit Wallet</h2>
+    ${tableHtml(["角色", "钱包地址", "Owner", "类型"], wallets.map((item) => [
+      `<span class="pill">${escapeHtml(item.wallet_role)}</span>`,
+      explorerAddress(item.wallet_address),
+      explorerAddress(item.owner_address),
+      escapeHtml(item.wallet_type),
+    ]))}
+
+    <h2>市场</h2>
+    ${tableHtml(["状态", "胜出", "创建者", "Market ID", "问题", "YES tokenId", "NO tokenId", "创建交易"], markets.map((item) => [
+      `<span class="pill green">${escapeHtml(item.status)}</span>`,
+      escapeHtml(item.winning_outcome || 0),
+      explorerAddress(item.creator),
+      escapeHtml(short(item.market_id, 10)),
+      escapeHtml(item.question),
+      escapeHtml(short(item.yes_token_id, 12)),
+      escapeHtml(short(item.no_token_id, 12)),
+      explorerTx(item.created_tx),
+    ]))}
+
+    <h2>订单</h2>
+    ${tableHtml(["订单ID", "方向", "Maker", "价格 micros", "makerAmount", "takerAmount", "状态"], orders.map((item) => [
+      escapeHtml(item.local_order_id),
+      `<span class="pill ${item.side === "BUY" ? "green" : "orange"}">${escapeHtml(item.side)}</span>`,
+      explorerAddress(item.maker),
+      escapeHtml(item.price_micros),
+      escapeHtml(item.maker_amount),
+      escapeHtml(item.taker_amount),
+      `<span class="pill green">${escapeHtml(item.status)}</span>`,
+    ]))}
+
+    <h2>订单簿</h2>
+    <div class="grid">
+      <div>
+        <h3>Bids 买单</h3>
+        ${tableHtml(["价格 micros", "数量", "订单数"], orderbook.bids.map((item) => [
+          escapeHtml(item.price_micros),
+          escapeHtml(item.total_size),
+          escapeHtml(item.order_count),
+        ]))}
+      </div>
+      <div>
+        <h3>Asks 卖单</h3>
+        ${tableHtml(["价格 micros", "数量", "订单数"], orderbook.asks.map((item) => [
+          escapeHtml(item.price_micros),
+          escapeHtml(item.total_size),
+          escapeHtml(item.order_count),
+        ]))}
+      </div>
+    </div>
+
+    <h2>成交</h2>
+    ${tableHtml(["交易", "Buyer", "Seller", "OutcomeAmount", "CollateralAmount"], trades.map((item) => [
+      explorerTx(item.tx_hash),
+      explorerAddress(item.buyer),
+      explorerAddress(item.seller),
+      escapeHtml(item.outcome_amount),
+      escapeHtml(item.collateral_amount),
+    ]))}
+
+    <h2>余额</h2>
+    ${tableHtml(["钱包", "资产", "Token ID", "余额"], balances.map((item) => [
+      explorerAddress(item.wallet_address),
+      escapeHtml(item.token_symbol),
+      escapeHtml(short(item.token_id, 12)),
+      escapeHtml(item.balance_decimal),
+    ]))}
+
+    <h2>链上事件</h2>
+    ${tableHtml(["区块", "LogIndex", "事件", "合约", "交易", "参数"], events.map((item) => [
+      escapeHtml(item.block_number),
+      escapeHtml(item.log_index),
+      `<span class="pill">${escapeHtml(item.event_name)}</span>`,
+      explorerAddress(item.contract_address),
+      explorerTx(item.tx_hash),
+      `<code>${escapeHtml(JSON.stringify(item.args_json))}</code>`,
+    ]))}
+  </main>
+</body>
+</html>`;
+}
+
+function orderbookForMarket(marketId) {
+  const activeStatuses = ["OPEN", "PARTIALLY_FILLED"];
+  const bids = rows(
+    `SELECT
+       price_micros,
+       SUM(CAST(taker_amount AS INTEGER) - CAST(filled_taker_amount AS INTEGER)) AS total_size,
+       COUNT(*) AS order_count
+     FROM orders
+     WHERE market_id = :marketId
+       AND side = 'BUY'
+       AND status IN ('OPEN', 'PARTIALLY_FILLED')
+     GROUP BY price_micros
+     ORDER BY price_micros DESC`,
+    { marketId },
+  );
+  const asks = rows(
+    `SELECT
+       price_micros,
+       SUM(CAST(maker_amount AS INTEGER) - CAST(filled_maker_amount AS INTEGER)) AS total_size,
+       COUNT(*) AS order_count
+     FROM orders
+     WHERE market_id = :marketId
+       AND side = 'SELL'
+       AND status IN ('OPEN', 'PARTIALLY_FILLED')
+     GROUP BY price_micros
+     ORDER BY price_micros ASC`,
+    { marketId },
+  );
+  return { marketId, activeStatuses, bids, asks };
+}
+
+const routes = {
+  "/api/summary": () => ({
+    dbPath,
+    counts: {
+      contracts: one("SELECT COUNT(*) AS count FROM contracts").count,
+      wallets: one("SELECT COUNT(*) AS count FROM wallets").count,
+      markets: one("SELECT COUNT(*) AS count FROM markets").count,
+      orders: one("SELECT COUNT(*) AS count FROM orders").count,
+      trades: one("SELECT COUNT(*) AS count FROM trades").count,
+      tokenBalances: one("SELECT COUNT(*) AS count FROM token_balances").count,
+      chainEvents: one("SELECT COUNT(*) AS count FROM chain_events").count,
+    },
+    syncState: rows("SELECT * FROM sync_state ORDER BY chain_id, name"),
+  }),
+  "/api/contracts": () =>
+    rows("SELECT * FROM contracts ORDER BY chain_id, name"),
+  "/api/wallets": () =>
+    rows("SELECT * FROM wallets ORDER BY chain_id, wallet_role, wallet_address"),
+  "/api/markets": () =>
+    rows("SELECT * FROM markets ORDER BY chain_id, updated_at DESC"),
+  "/api/orders": (url) => {
+    const status = url.searchParams.get("status");
+    const marketId = url.searchParams.get("marketId");
+    const side = url.searchParams.get("side");
+    const clauses = [];
+    const params = { limit: limit(url), offset: offset(url) };
+    if (status) {
+      clauses.push("status = :status");
+      params.status = status;
+    }
+    if (marketId) {
+      clauses.push("market_id = :marketId");
+      params.marketId = marketId;
+    }
+    if (side) {
+      clauses.push("side = :side");
+      params.side = side.toUpperCase();
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    return rows(
+      `SELECT * FROM orders ${where} ORDER BY updated_at DESC LIMIT :limit OFFSET :offset`,
+      params,
+    );
+  },
+  "/api/orderbook": (url) => {
+    const requestedMarketId = url.searchParams.get("marketId");
+    const market = requestedMarketId
+      ? one("SELECT market_id FROM markets WHERE market_id = :marketId", {
+          marketId: requestedMarketId,
+        })
+      : one("SELECT market_id FROM markets ORDER BY updated_at DESC LIMIT 1");
+    if (!market) {
+      return { marketId: requestedMarketId, bids: [], asks: [] };
+    }
+    return orderbookForMarket(market.market_id);
+  },
+  "/api/trades": (url) => {
+    const marketId = url.searchParams.get("marketId");
+    const clauses = [];
+    const params = { limit: limit(url), offset: offset(url) };
+    if (marketId) {
+      clauses.push("market_id = :marketId");
+      params.marketId = marketId;
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    return rows(
+      `SELECT * FROM trades ${where} ORDER BY created_at DESC LIMIT :limit OFFSET :offset`,
+      params,
+    );
+  },
+  "/api/balances": (url) => {
+    const wallet = url.searchParams.get("wallet");
+    const symbol = url.searchParams.get("symbol");
+    const clauses = [];
+    const params = {};
+    if (wallet) {
+      clauses.push("lower(wallet_address) = lower(:wallet)");
+      params.wallet = wallet;
+    }
+    if (symbol) {
+      clauses.push("token_symbol = :symbol");
+      params.symbol = symbol;
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    return rows(
+      `SELECT * FROM token_balances ${where} ORDER BY wallet_address, token_symbol, token_id`,
+      params,
+    );
+  },
+  "/api/events": (url) => {
+    const eventName = url.searchParams.get("eventName");
+    const txHash = url.searchParams.get("txHash");
+    const contract = url.searchParams.get("contract");
+    const clauses = [];
+    const params = { limit: limit(url), offset: offset(url) };
+    if (eventName) {
+      clauses.push("event_name = :eventName");
+      params.eventName = eventName;
+    }
+    if (txHash) {
+      clauses.push("lower(tx_hash) = lower(:txHash)");
+      params.txHash = txHash;
+    }
+    if (contract) {
+      clauses.push("lower(contract_address) = lower(:contract)");
+      params.contract = contract;
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    return rows(
+      `SELECT * FROM chain_events ${where} ORDER BY block_number DESC, log_index DESC LIMIT :limit OFFSET :offset`,
+      params,
+    );
+  },
+  "/api/matcher/status": () => readMatcherStatus(),
+  "/api/chain-sync/status": () => readChainSyncStatus(),
+};
+
+function marketOrderbookPath(pathname) {
+  const match = pathname.match(/^\/api\/markets\/(.+)\/orderbook$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function orderActionPath(pathname) {
+  const match = pathname.match(/^\/api\/orders\/(.+)\/(cancel|fill|cancel-chain)$/);
+  return match
+    ? { localOrderId: decodeURIComponent(match[1]), action: match[2] }
+    : null;
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    if (!req.url) return badRequest(res, "Missing URL");
+    const url = new URL(req.url, `http://${req.headers.host ?? `${host}:${port}`}`);
+
+    if (req.method === "OPTIONS") {
+      res.writeHead(204, {
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET, POST, OPTIONS",
+        "access-control-allow-headers": "content-type",
+      });
+      res.end();
+      return;
+    }
+
+    if (req.method === "POST") {
+      if (url.pathname === "/api/orders/seed-signed") {
+        return json(res, 200, await seedSignedOrders());
+      }
+      if (url.pathname === "/api/orders/match-chain") {
+        const body = await readJsonBody(req);
+        return json(res, 200, await matchOrdersOnchain(body));
+      }
+      if (url.pathname === "/api/sync") {
+        return json(res, 200, await syncDatabaseFromChain());
+      }
+      if (url.pathname === "/api/orders") {
+        const body = await readJsonBody(req);
+        return json(res, 201, insertOrder(body));
+      }
+      const action = orderActionPath(url.pathname);
+      if (action?.action === "cancel") {
+        return json(res, 200, cancelOrder(action.localOrderId));
+      }
+      if (action?.action === "fill") {
+        const body = await readJsonBody(req);
+        return json(res, 200, fillOrder(action.localOrderId, body));
+      }
+      if (action?.action === "cancel-chain") {
+        const body = await readJsonBody(req);
+        return json(res, 200, await cancelOrderOnchain(action.localOrderId, body));
+      }
+      return notFound(res, url.pathname);
+    }
+
+    if (req.method !== "GET") {
+      return badRequest(res, "Only GET/POST is supported");
+    }
+
+    if (url.pathname === "/" || url.pathname === "/index.html") {
+      return html(res, indexPage());
+    }
+    if (url.pathname === "/dashboard") {
+      return html(res, dashboardPage());
+    }
+    if (url.pathname === "/trade") {
+      return html(res, tradePage());
+    }
+
+    const marketId = marketOrderbookPath(url.pathname);
+    if (marketId) {
+      return json(res, 200, orderbookForMarket(marketId));
+    }
+
+    const route = routes[url.pathname];
+    if (!route) return notFound(res, url.pathname);
+    return json(res, 200, route(url));
+  } catch (error) {
+    return internalError(res, error);
+  }
+});
+
+server.listen(port, host, () => {
+  console.log(`Research Polymarket API 已启动：http://${host}:${port}`);
+  console.log(`数据库：${dbPath}`);
+});
+
+function shutdown() {
+  server.close(() => {
+    db.close();
+    process.exit(0);
+  });
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

@@ -1,0 +1,48 @@
+{
+  "name": "polymarket-deposit-wallet",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Polygon Amoy research system for Polymarket-like deposit wallets, markets, signed orders, and onchain settlement.",
+  "scripts": {
+    "build": "tsc --noEmit && tsx scripts/compile-contract.ts",
+    "check": "tsx scripts/check-wallet.ts",
+    "wallet:deploy": "tsx scripts/deploy-deposit-wallet.ts",
+    "research:deploy": "tsx scripts/deploy-research-polymarket.ts",
+    "research:simulate": "tsx scripts/simulate-official-like-market.ts",
+    "db:init": "node scripts/db-init.mjs",
+    "db:import:research": "node scripts/db-import-research.mjs",
+    "db:sync:events": "node scripts/db-sync-events.mjs",
+    "db:sync:balances": "node scripts/db-sync-balances.mjs",
+    "chain-sync": "node scripts/chain-sync-service.mjs",
+    "chain-sync:once": "node scripts/chain-sync-service.mjs --once",
+    "db:summary": "node scripts/db-summary.mjs",
+    "api": "node scripts/api-server.mjs",
+    "api:restart": "node scripts/api-restart.mjs",
+    "orders:seed:signed": "node scripts/seed-signed-orders.mjs",
+    "orders:match": "node scripts/match-research-orders.mjs",
+    "matcher": "LIVE_ACTION=MATCH_RESEARCH_ORDERS LIVE_CONFIRMATION=AMOY_TESTNET_ONLY node scripts/matcher-service.mjs",
+    "matcher:once": "LIVE_ACTION=MATCH_RESEARCH_ORDERS LIVE_CONFIRMATION=AMOY_TESTNET_ONLY node scripts/matcher-service.mjs --once",
+    "matcher:dry-run": "MATCHER_DRY_RUN=true node scripts/matcher-service.mjs --once --dry-run",
+    "orders:cancel:chain": "node scripts/cancel-research-order.mjs",
+    "exchange:deploy:new": "tsx scripts/deploy-new-exchange.ts",
+    "exchange:approve": "tsx scripts/approve-current-exchange.ts",
+    "trade:testnet": "tsx scripts/trade-testnet.ts"
+  },
+  "dependencies": {
+    "@polymarket/builder-relayer-client": "0.0.10",
+    "@polymarket/builder-signing-sdk": "0.0.8",
+    "@polymarket/clob-client-v2": "1.0.6",
+    "dotenv": "17.4.2",
+    "viem": "2.53.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.0.10",
+    "solc": "0.8.35",
+    "tsx": "4.22.4",
+    "typescript": "6.0.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

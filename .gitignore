@@ -1,0 +1,22 @@
+node_modules/
+
+# Local secrets
+.env
+.env.local
+.env.*.local
+
+# Generated build/deployment runtime files
+artifacts/
+cache/
+typechain-types/
+
+# Local database/runtime state
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Logs and OS/editor noise
+*.log
+.DS_Store
+.vscode/

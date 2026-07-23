@@ -1,0 +1,59 @@
+{
+  "outcomeToken": "0xe3d4441cad10fab7f52e427133afbc04c9b043ce",
+  "walletFactory": "0x44ce931ad59fec9f062f7acc885ea1bd77329ca4",
+  "chainId": 80002,
+  "owner": "0x4A2268D5047E9A03c4C6A279d833337D9DD1909e",
+  "walletCoin": "0x45d60abe715a22d3201bba2865ccfe1f646b3ab4",
+  "buyerWallet": "0xb2E67683d5C3a3EA40ebB343F87AE3E46a1aC8D7",
+  "sellerWallet": "0xa1BBC54F33Bc3017646d72791FBD7f3D8ef36845",
+  "marketRegistry": "0xb385f70c306d2144864ae8a6ad6438276f7ed5a9",
+  "market": {
+    "marketId": "0x2c17efa29cc362e31c3397bb88a50559ac5bac5eb5a7fe870251d4ab99001afd",
+    "question": "Will this research Polymarket-like demo trade settle on Amoy?",
+    "closeTime": "1784961476",
+    "yesTokenId": "63381633297021370439416001554321513640260000365839576830918270263440839224689",
+    "noTokenId": "6954229580046486333894897536273927696442659958860094442212843795798185356023"
+  },
+  "orders": {
+    "buyOrder": {
+      "maker": "0xb2E67683d5C3a3EA40ebB343F87AE3E46a1aC8D7",
+      "signer": "0xb2E67683d5C3a3EA40ebB343F87AE3E46a1aC8D7",
+      "tokenId": "63381633297021370439416001554321513640260000365839576830918270263440839224689",
+      "makerAmount": "600000",
+      "takerAmount": "1000000",
+      "side": 0,
+      "expiration": "0",
+      "salt": "1784356686487",
+      "signature": "0x5862ed2d1e42abe40321d2e4a320f59a0246203f258630007fce972f6b1ece2f1574d437b5a2bc7d140b6027a7900606bc58511f5c852050c4c49128adb590531b"
+    },
+    "sellOrder": {
+      "maker": "0xa1BBC54F33Bc3017646d72791FBD7f3D8ef36845",
+      "signer": "0xa1BBC54F33Bc3017646d72791FBD7f3D8ef36845",
+      "tokenId": "63381633297021370439416001554321513640260000365839576830918270263440839224689",
+      "makerAmount": "1000000",
+      "takerAmount": "550000",
+      "side": 1,
+      "expiration": "0",
+      "salt": "1784356686488",
+      "signature": "0x6c5a8cddbfd49206de2410bf857351f3d9f16fc85c3914fe044e93cfe83c0d015e51555c691de17c3539cb63debb20f95dcc6219309f68a09fce8147f6148a611c"
+    }
+  },
+  "txs": {
+    "publishTx": "0x4bd631412770947c66e954893257444402d93c02ca9372c831f1afef64e1f1b8",
+    "mintBuyerCoinTx": "0xca8c55654c37211fb3308b1cba9298df1c8a253908ef2a195942e6bb21f364b3",
+    "mintSellerYesTx": "0x7f0266d4d1dab9015608e6cfc32995a1c1b9c721f849140629be19eabac029e0",
+    "buyerApproveTx": "already-approved",
+    "sellerApproveTx": "already-approved",
+    "matchTx": "0xc620b69dea718fcb87ff2403a3c79f48d4ef2c7e3a89fac2d90aae8d84563727"
+  },
+  "finalBalances": {
+    "buyerRWALLET": "397.23",
+    "sellerRWALLET": "2.77",
+    "buyerYES": "1",
+    "sellerYES": "9"
+  },
+  "exchange": "0x14446dd925297ccd94dc6c41593bd6e933fd2131",
+  "previousExchanges": [
+    "0xc6aa87baf0b049a20081c24f47c7684b984ac1fb"
+  ]
+}

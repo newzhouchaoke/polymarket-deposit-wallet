@@ -1,0 +1,17 @@
+{
+  "chainId": 80002,
+  "owner": "0x4A2268D5047E9A03c4C6A279d833337D9DD1909e",
+  "collateral": "0x34f7520a6f275adadd23cbb11b75d95149d03f2e",
+  "outcomeToken": "0xe3d4441cad10fab7f52e427133afbc04c9b043ce",
+  "walletFactory": "0x44ce931ad59fec9f062f7acc885ea1bd77329ca4",
+  "exchange": "0x077a509b5406656ceb0078fa7178c867bdca60e6",
+  "buyerWallet": "0xb2E67683d5C3a3EA40ebB343F87AE3E46a1aC8D7",
+  "sellerWallet": "0xa1BBC54F33Bc3017646d72791FBD7f3D8ef36845",
+  "tokenId": "1",
+  "finalBalances": {
+    "buyerRUSD": "99.45",
+    "sellerRUSD": "0.55",
+    "buyerYES": "1",
+    "sellerYES": "9"
+  }
+}

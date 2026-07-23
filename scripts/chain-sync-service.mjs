@@ -1,0 +1,136 @@
+import fs from "node:fs";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import { projectDir } from "./db.js";
+
+export const chainSyncStatusPath = path.join(projectDir, "data", "chain-sync-status.json");
+
+const intervalMs = Number(process.env.CHAIN_SYNC_INTERVAL_MS ?? "12000");
+const syncChunkSize = String(process.env.SYNC_CHUNK_SIZE ?? "200");
+const syncMaxBlocksPerRun = String(process.env.SYNC_MAX_BLOCKS_PER_RUN ?? "1000");
+const once = process.argv.includes("--once");
+
+if (!Number.isInteger(intervalMs) || intervalMs < 3000) {
+  throw new Error("CHAIN_SYNC_INTERVAL_MS 必须是 >= 3000 的整数毫秒");
+}
+
+function writeStatus(status) {
+  fs.mkdirSync(path.dirname(chainSyncStatusPath), { recursive: true });
+  fs.writeFileSync(
+    chainSyncStatusPath,
+    `${JSON.stringify({ updatedAt: new Date().toISOString(), ...status }, null, 2)}\n`,
+  );
+}
+
+function readStatus() {
+  if (!fs.existsSync(chainSyncStatusPath)) {
+    return {
+      updatedAt: null,
+      running: false,
+      message: "链上事件持续同步服务尚未写入状态",
+    };
+  }
+  return JSON.parse(fs.readFileSync(chainSyncStatusPath, "utf8"));
+}
+
+function runCommand(command, args, env = process.env) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: projectDir,
+      env,
+      shell: false,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve({ stdout: stdout.trim(), stderr: stderr.trim() });
+      else reject(new Error(stderr || stdout || `Command failed with code ${code}`));
+    });
+  });
+}
+
+async function runTick() {
+  const startedAt = new Date().toISOString();
+  const events = await runCommand("node", ["scripts/db-sync-events.mjs"], {
+    ...process.env,
+    FULL_SYNC: "true",
+    SYNC_CHUNK_SIZE: syncChunkSize,
+    SYNC_MAX_BLOCKS_PER_RUN: syncMaxBlocksPerRun,
+  });
+  const balances = await runCommand("node", ["scripts/db-sync-balances.mjs"]);
+  const status = {
+    running: true,
+    intervalMs,
+    syncChunkSize: Number(syncChunkSize),
+    syncMaxBlocksPerRun: Number(syncMaxBlocksPerRun),
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    events,
+    balances,
+  };
+  writeStatus(status);
+  return status;
+}
+
+let stopped = false;
+
+async function loop() {
+  while (!stopped) {
+    try {
+      const status = await runTick();
+      const eventLine =
+        status.events.stdout.split("\n").find((line) => line.includes("同步完成")) ??
+        status.events.stdout.split("\n").find((line) => line.includes("已是最新")) ??
+        "同步完成";
+      console.log(`[chain-sync] ${new Date().toISOString()} ${eventLine}`);
+      if (once) break;
+    } catch (error) {
+      const previous = readStatus();
+      writeStatus({
+        ...previous,
+        running: !once,
+        intervalMs,
+        errorAt: new Date().toISOString(),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      console.error("[chain-sync] error:", error);
+      if (once) {
+        process.exitCode = 1;
+        break;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  const previous = readStatus();
+  writeStatus({
+    ...previous,
+    running: false,
+    stoppedAt: new Date().toISOString(),
+  });
+}
+
+writeStatus({
+  running: true,
+  intervalMs,
+  syncChunkSize: Number(syncChunkSize),
+  syncMaxBlocksPerRun: Number(syncMaxBlocksPerRun),
+  pid: process.pid,
+  startedAt: new Date().toISOString(),
+  message: "链上事件持续同步服务启动",
+});
+
+process.on("SIGINT", () => {
+  stopped = true;
+});
+process.on("SIGTERM", () => {
+  stopped = true;
+});
+
+await loop();
