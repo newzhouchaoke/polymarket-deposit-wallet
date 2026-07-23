@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import { getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { dbPath, initSchema, openDatabase, projectDir, upsert } from "./db.js";
+import { CANCEL_TYPES, ORDER_TYPES } from "./erc7739.mjs";
 
 dotenv.config({ path: path.join(projectDir, "..", ".env"), quiet: true });
 dotenv.config({ path: path.join(projectDir, ".env"), override: true, quiet: true });
@@ -12,27 +13,10 @@ delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
 export const deploymentPath = path.join(
   projectDir,
   "deployments",
-  "research-official-like-amoy.json",
+  "research-v2-amoy.json",
 );
 
-export const ORDER_TYPES = {
-  Order: [
-    { name: "maker", type: "address" },
-    { name: "signer", type: "address" },
-    { name: "tokenId", type: "uint256" },
-    { name: "makerAmount", type: "uint256" },
-    { name: "takerAmount", type: "uint256" },
-    { name: "side", type: "uint8" },
-    { name: "expiration", type: "uint256" },
-    { name: "salt", type: "uint256" },
-  ],
-};
-
-export const CANCEL_TYPES = {
-  Cancel: [
-    { name: "orderHash", type: "bytes32" },
-  ],
-};
+export { CANCEL_TYPES, ORDER_TYPES };
 
 export function loadDeployment() {
   if (!fs.existsSync(deploymentPath)) {
@@ -109,8 +93,8 @@ export function priceMicros(order) {
 
 export function domainFor(deployment) {
   return {
-    name: "ResearchCLOBExchange",
-    version: "1",
+    name: "Polymarket CTF Exchange",
+    version: "2",
     chainId: Number(deployment.chainId),
     verifyingContract: getAddress(deployment.exchange),
   };
@@ -126,7 +110,11 @@ export function insertDbOrder(db, deployment, localOrderId, order, signature, st
       makerAmount: order.makerAmount.toString(),
       takerAmount: order.takerAmount.toString(),
       side: order.side,
-      expiration: order.expiration.toString(),
+      signatureType: Number(order.signatureType),
+      timestamp: order.timestamp.toString(),
+      metadata: order.metadata,
+      builder: order.builder,
+      expiration: String(order.expiration ?? 0),
       salt: order.salt.toString(),
       signature,
     },
@@ -172,7 +160,7 @@ export function insertDbOrder(db, deployment, localOrderId, order, signature, st
       takerAmount: order.takerAmount.toString(),
       priceMicros: priceMicros(order),
       status,
-      expiration: Number(order.expiration),
+      expiration: Number(order.expiration ?? 0),
       salt: order.salt.toString(),
       signature,
       rawJson,
@@ -184,14 +172,18 @@ export function insertDbOrder(db, deployment, localOrderId, order, signature, st
 export function toContractOrder(row) {
   const raw = typeof row.raw_json === "string" ? JSON.parse(row.raw_json) : row.raw_json;
   return {
+    salt: BigInt(row.salt ?? raw?.salt),
     maker: getAddress(row.maker),
     signer: getAddress(row.signer),
     tokenId: BigInt(row.token_id),
     makerAmount: BigInt(row.maker_amount),
     takerAmount: BigInt(row.taker_amount),
     side: sideNumber(row.side),
-    expiration: BigInt(row.expiration ?? raw?.expiration ?? 0),
-    salt: BigInt(row.salt ?? raw?.salt),
+    signatureType: Number(raw?.signatureType ?? 3),
+    timestamp: BigInt(raw?.timestamp ?? Math.floor(Date.now() / 1000)),
+    metadata: raw?.metadata ?? `0x${"00".repeat(32)}`,
+    builder: raw?.builder ?? `0x${"00".repeat(32)}`,
+    signature: row.signature ?? raw?.signature ?? "0x",
   };
 }
 

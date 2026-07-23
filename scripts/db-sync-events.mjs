@@ -19,7 +19,7 @@ delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
 const deploymentPath = path.join(
   projectDir,
   "deployments",
-  "research-official-like-amoy.json",
+  "research-v2-amoy.json",
 );
 const deployment = JSON.parse(fs.readFileSync(deploymentPath, "utf8"));
 const chainId = Number(deployment.chainId);
@@ -117,14 +117,14 @@ function bigintJson(value) {
 function getSyncState() {
   return db
     .prepare("SELECT last_block FROM sync_state WHERE chain_id = ? AND name = ?")
-    .get(chainId, "official-like-events");
+    .get(chainId, "research-v2-events");
 }
 
 function setSyncState(lastBlock) {
   upsert(
     db,
     `INSERT INTO sync_state(chain_id, name, last_block, updated_at)
-     VALUES(:chainId, 'official-like-events', :lastBlock, CURRENT_TIMESTAMP)
+     VALUES(:chainId, 'research-v2-events', :lastBlock, CURRENT_TIMESTAMP)
      ON CONFLICT(chain_id, name) DO UPDATE SET
        last_block=excluded.last_block,
        updated_at=excluded.updated_at`,
@@ -244,6 +244,7 @@ function upsertTradeFromEvent(event, txHash) {
 
 function upsertTradeFromOrdersMatched(event, txHash) {
   const args = event.args;
+  const takerIsBuy = Number(args.side) === 0;
   const existing = db
     .prepare("SELECT buy_order_id, sell_order_id FROM trades WHERE chain_id = ? AND tx_hash = ?")
     .get(chainId, txHash);
@@ -271,11 +272,11 @@ function upsertTradeFromOrdersMatched(event, txHash) {
       chainId,
       txHash,
       marketId: deployment.market.marketId,
-      buyer: args.buyer,
-      seller: args.seller,
+      buyer: takerIsBuy ? args.takerOrderMaker : deployment.sellerWallet,
+      seller: takerIsBuy ? deployment.sellerWallet : args.takerOrderMaker,
       tokenId: args.tokenId.toString(),
-      outcomeAmount: args.outcomeAmount.toString(),
-      collateralAmount: args.collateralAmount.toString(),
+      outcomeAmount: (takerIsBuy ? args.takerAmountFilled : args.makerAmountFilled).toString(),
+      collateralAmount: (takerIsBuy ? args.makerAmountFilled : args.takerAmountFilled).toString(),
       buyOrderId: existing?.buy_order_id ?? null,
       sellOrderId: existing?.sell_order_id ?? null,
       rawJson: bigintJson(args),
@@ -358,8 +359,6 @@ function saveEvent(log, decoded, config) {
     closeMarketFromEvent(decoded);
   } else if (decoded.eventName === "MarketResolved") {
     resolveMarketFromEvent(decoded);
-  } else if (decoded.eventName === "TradeExecuted") {
-    upsertTradeFromEvent(decoded, log.transactionHash);
   } else if (decoded.eventName === "OrdersMatched") {
     upsertTradeFromOrdersMatched(decoded, log.transactionHash);
   } else if (decoded.eventName === "OrderCancelled") {

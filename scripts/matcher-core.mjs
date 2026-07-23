@@ -209,7 +209,15 @@ export async function matchOnce(options = {}) {
       address: deployment.exchange,
       abi: exchangeArtifact.abi,
       functionName: "matchOrders",
-      args: [buyOrder, pair.buy.signature, sellOrder, pair.sell.signature, outcomeAmount],
+      args: [
+        deployment.market.conditionId ?? deployment.market.marketId,
+        buyOrder,
+        [sellOrder],
+        collateralAmount,
+        [outcomeAmount],
+        0n,
+        [0n],
+      ],
     });
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
     if (receipt.status !== "success") throw new Error(`撮合交易失败：${hash}`);

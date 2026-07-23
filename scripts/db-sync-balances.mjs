@@ -84,7 +84,7 @@ for (const wallet of wallets) {
       address: deployment.outcomeToken,
       abi: outcomeArtifact.abi,
       functionName: "balanceOf",
-      args: [BigInt(tokenId), wallet],
+      args: [wallet, BigInt(tokenId)],
     });
     upsert(
       db,

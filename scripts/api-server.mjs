@@ -195,6 +195,10 @@ function insertOrder(order) {
     takerAmount,
     expiration: Number(order.expiration ?? 0),
     salt: String(order.salt ?? Date.now()),
+    signatureType: Number(order.signatureType ?? 3),
+    timestamp: String(order.timestamp ?? Math.floor(Date.now() / 1000)),
+    metadata: String(order.metadata ?? `0x${"00".repeat(32)}`),
+    builder: String(order.builder ?? `0x${"00".repeat(32)}`),
     signature: typeof order.signature === "string" ? order.signature : null,
     status: String(order.status ?? "OPEN").toUpperCase(),
     filledMakerAmount: String(order.filledMakerAmount ?? order.filled_maker_amount ?? "0"),
@@ -1010,7 +1014,7 @@ function dashboardPage() {
       <a href="/api/summary">JSON 摘要</a>
       <a href="/trade">下单页面</a>
       <a href="/api/orderbook${firstMarketId ? `?marketId=${escapeHtml(firstMarketId)}` : ""}">订单簿 JSON</a>
-      <a href="/api/events?eventName=TradeExecuted">TradeExecuted JSON</a>
+      <a href="/api/events?eventName=OrdersMatched">OrdersMatched JSON</a>
       <a href="/api/matcher/status">自动撮合状态</a>
       <a href="https://amoy.polygonscan.com/" target="_blank" rel="noreferrer">Amoy Polygonscan</a>
     </div>

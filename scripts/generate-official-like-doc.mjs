@@ -13,11 +13,10 @@ const outputPath = path.join(
 const buildDir = fs.mkdtempSync(path.join(os.tmpdir(), "official-like-docx-"));
 const sourcePath = path.join(projectDir, "contracts", "ResearchPolymarketLike.sol");
 const scriptPath = path.join(projectDir, "scripts", "simulate-official-like-market.ts");
-const deploymentPath = path.join(
-  projectDir,
-  "deployments",
-  "research-official-like-amoy.json",
-);
+const v2DeploymentPath = path.join(projectDir, "deployments", "research-v2-amoy.json");
+const deploymentPath = fs.existsSync(v2DeploymentPath)
+  ? v2DeploymentPath
+  : path.join(projectDir, "deployments", "research-official-like-amoy.json");
 
 const source = fs.readFileSync(sourcePath, "utf8");
 const script = fs.readFileSync(scriptPath, "utf8");

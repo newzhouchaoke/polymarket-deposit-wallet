@@ -8,7 +8,10 @@ import { dbPath, initSchema, openDatabase, projectDir } from "./db.js";
 const outputName = "Polymarket_项目交易流程步骤说明.docx";
 const docsDir = path.join(projectDir, "docs");
 const outputPath = path.join(docsDir, outputName);
-const deploymentPath = path.join(projectDir, "deployments", "research-official-like-amoy.json");
+const v2DeploymentPath = path.join(projectDir, "deployments", "research-v2-amoy.json");
+const deploymentPath = fs.existsSync(v2DeploymentPath)
+  ? v2DeploymentPath
+  : path.join(projectDir, "deployments", "research-official-like-amoy.json");
 const deployment = fs.existsSync(deploymentPath)
   ? JSON.parse(fs.readFileSync(deploymentPath, "utf8"))
   : {};
@@ -179,21 +182,25 @@ body.push(
   ),
   code([
     "Order {",
+    "  salt,",
     "  maker,        // 持有资产的钱包地址",
-    "  signer,       // 验签主体；本项目中等于 Deposit Wallet",
+    "  signer,",
     "  tokenId,      // YES/NO tokenId",
     "  makerAmount,",
     "  takerAmount,",
     "  side,         // 0=BUY, 1=SELL",
-    "  expiration,",
-    "  salt",
+    "  signatureType,",
+    "  timestamp,",
+    "  metadata,",
+    "  builder,",
+    "  signature",
     "}",
   ]),
 );
 
 body.push(
   heading("6. 对订单签名", 1),
-  paragraph("订单采用 EIP-712 签名。这里最关键的是：订单 signer 是 Deposit Wallet 地址，但实际签名由 owner 私钥完成。"),
+  paragraph("订单采用 CTF Exchange V2 风格 EIP-712 签名。Deposit Wallet 订单的 maker 与 signer 都是钱包地址，由 owner 私钥签署后通过 ERC-1271 验证。"),
   code([
     "订单 signer = Deposit Wallet 地址",
     "实际签名者 = owner 私钥",

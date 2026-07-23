@@ -1,7 +1,6 @@
-import { createWalletClient, fallback, http, parseUnits } from "viem";
+import { createWalletClient, fallback, http, parseUnits, zeroHash } from "viem";
 import { polygonAmoy } from "viem/chains";
 import {
-  ORDER_TYPES,
   account,
   dbPath,
   domainFor,
@@ -9,6 +8,7 @@ import {
   loadDeployment,
   openResearchDb,
 } from "./order-utils.mjs";
+import { signErc7739Order } from "./erc7739.mjs";
 
 function amoyRpcUrls() {
   const configured = process.env.AMOY_RPC_URLS || process.env.AMOY_RPC_URL;
@@ -37,42 +37,47 @@ const walletClient = createWalletClient({
 });
 const domain = domainFor(deployment);
 const salt = BigInt(Date.now());
+const timestamp = BigInt(Math.floor(Date.now() / 1000));
 
 const buyOrder = {
+  salt,
   maker: deployment.buyerWallet,
   signer: deployment.buyerWallet,
   tokenId: BigInt(deployment.market.yesTokenId),
   makerAmount: parseUnits("1.14", 6),
   takerAmount: parseUnits("2", 6),
   side: 0,
-  expiration: 0n,
-  salt,
+  signatureType: 3,
+  timestamp,
+  metadata: zeroHash,
+  builder: zeroHash,
 };
 const sellOrder = {
+  salt: salt + 1n,
   maker: deployment.sellerWallet,
   signer: deployment.sellerWallet,
   tokenId: BigInt(deployment.market.yesTokenId),
   makerAmount: parseUnits("1", 6),
   takerAmount: parseUnits("0.56", 6),
   side: 1,
-  expiration: 0n,
-  salt: salt + 1n,
+  signatureType: 3,
+  timestamp,
+  metadata: zeroHash,
+  builder: zeroHash,
 };
 
 const [buySignature, sellSignature] = await Promise.all([
-  walletClient.signTypedData({
+  signErc7739Order({
+    walletClient,
     account: signer,
-    domain,
-    types: ORDER_TYPES,
-    primaryType: "Order",
-    message: buyOrder,
+    appDomain: domain,
+    order: buyOrder,
   }),
-  walletClient.signTypedData({
+  signErc7739Order({
+    walletClient,
     account: signer,
-    domain,
-    types: ORDER_TYPES,
-    primaryType: "Order",
-    message: sellOrder,
+    appDomain: domain,
+    order: sellOrder,
   }),
 ]);
 

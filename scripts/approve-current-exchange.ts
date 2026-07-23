@@ -18,7 +18,7 @@ type Deployment = {
 const deploymentPath = path.resolve(
   PROJECT_DIR,
   "deployments",
-  "research-official-like-amoy.json",
+  "research-v2-amoy.json",
 );
 
 async function wait(hash: Hash, label: string): Promise<Hash> {
@@ -82,19 +82,35 @@ const sellerApproved = (await publicClient.readContract({
 
 let sellerApproveTx = "already-approved";
 if (!sellerApproved) {
-  sellerApproveTx = await wait(
-    await walletClient.writeContract({
-      account,
-      chain: polygonAmoy,
-      address: deployment.sellerWallet,
-      abi: walletArtifact.abi,
-      functionName: "executeBatch",
-      args: [[{ target: deployment.outcomeToken, value: 0n, data: approveOutcome }]],
-      maxFeePerGas: parseGwei("30"),
-      maxPriorityFeePerGas: parseGwei("25"),
-    }),
-    "seller Deposit Wallet 授权 YES/NO 给当前 Exchange",
-  );
+  if (deployment.sellerWallet.toLowerCase() === account.address.toLowerCase()) {
+    sellerApproveTx = await wait(
+      await walletClient.writeContract({
+        account,
+        chain: polygonAmoy,
+        address: deployment.outcomeToken,
+        abi: outcomeArtifact.abi,
+        functionName: "setApprovalForAll",
+        args: [deployment.exchange, true],
+        maxFeePerGas: parseGwei("30"),
+        maxPriorityFeePerGas: parseGwei("25"),
+      }),
+      "seller EOA 授权 YES/NO 给当前 Exchange",
+    );
+  } else {
+    sellerApproveTx = await wait(
+      await walletClient.writeContract({
+        account,
+        chain: polygonAmoy,
+        address: deployment.sellerWallet,
+        abi: walletArtifact.abi,
+        functionName: "executeBatch",
+        args: [[{ target: deployment.outcomeToken, value: 0n, data: approveOutcome }]],
+        maxFeePerGas: parseGwei("30"),
+        maxPriorityFeePerGas: parseGwei("25"),
+      }),
+      "seller Deposit Wallet 授权 YES/NO 给当前 Exchange",
+    );
+  }
 } else {
   console.log("seller Deposit Wallet 已授权当前 Exchange，跳过");
 }

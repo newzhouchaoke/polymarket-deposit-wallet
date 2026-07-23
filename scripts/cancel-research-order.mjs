@@ -10,6 +10,7 @@ import {
   readArtifact,
   toContractOrder,
 } from "./order-utils.mjs";
+import { signErc7739TypedData } from "./erc7739.mjs";
 
 function amoyRpcUrls() {
   const configured = process.env.AMOY_RPC_URLS || process.env.AMOY_RPC_URL;
@@ -90,13 +91,23 @@ const orderHash = await publicClient.readContract({
   functionName: "hashOrder",
   args: [order],
 });
-const cancelSignature = await walletClient.signTypedData({
+const cancelSignature = Number(order.signatureType) === 3
+  ? await signErc7739TypedData({
+      walletClient,
+      account: signer,
+      appDomain: domainFor(deployment),
+      contentsTypes: CANCEL_TYPES,
+      primaryType: "Cancel",
+      contents: { orderHash },
+      depositWallet: order.maker,
+    })
+  : await walletClient.signTypedData({
   account: signer,
   domain: domainFor(deployment),
   types: CANCEL_TYPES,
   primaryType: "Cancel",
   message: { orderHash },
-});
+  });
 
 const txHash = await walletClient.writeContract({
   account: signer,

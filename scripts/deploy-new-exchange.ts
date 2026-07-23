@@ -10,7 +10,7 @@ import { assertLiveAction, PROJECT_DIR } from "../src/env.js";
 const deploymentPath = path.resolve(
   PROJECT_DIR,
   "deployments",
-  "research-official-like-amoy.json",
+  "research-v2-amoy.json",
 );
 
 type Deployment = {
@@ -18,6 +18,7 @@ type Deployment = {
   owner: Address;
   walletCoin: Address;
   outcomeToken: Address;
+  walletFactory: Address;
   exchange?: Address;
   previousExchanges?: Address[];
   txs?: Record<string, string>;
@@ -39,8 +40,8 @@ if (!fs.existsSync(deploymentPath)) {
   throw new Error(`缺少部署记录：${deploymentPath}`);
 }
 const deployment = JSON.parse(fs.readFileSync(deploymentPath, "utf8")) as Deployment;
-if (!deployment.walletCoin || !deployment.outcomeToken) {
-  throw new Error("部署记录缺少 walletCoin/outcomeToken");
+if (!deployment.walletCoin || !deployment.outcomeToken || !deployment.walletFactory) {
+  throw new Error("部署记录缺少 walletCoin/outcomeToken/walletFactory");
 }
 
 const artifact = readArtifact("ResearchCLOBExchange");
@@ -49,7 +50,14 @@ const hash = await walletClient.deployContract({
   chain: polygonAmoy,
   abi: artifact.abi,
   bytecode: artifact.bytecode,
-  args: [deployment.walletCoin, deployment.outcomeToken, account.address],
+  args: [
+    deployment.walletCoin,
+    deployment.outcomeToken,
+    deployment.walletFactory,
+    account.address,
+    account.address,
+    account.address,
+  ],
   maxFeePerGas: parseGwei("30"),
   maxPriorityFeePerGas: parseGwei("25"),
 });
@@ -64,9 +72,25 @@ deployment.previousExchanges = [
   ...new Set([...(deployment.previousExchanges ?? []), ...(previous ? [previous] : [])]),
 ];
 deployment.exchange = receipt.contractAddress;
+const outcomeArtifact = readArtifact("ResearchOutcomeToken");
+const configureHash = await walletClient.writeContract({
+  account,
+  chain: polygonAmoy,
+  address: deployment.outcomeToken,
+  abi: outcomeArtifact.abi,
+  functionName: "setExchange",
+  args: [receipt.contractAddress],
+  maxFeePerGas: parseGwei("30"),
+  maxPriorityFeePerGas: parseGwei("25"),
+});
+const configureReceipt = await publicClient.waitForTransactionReceipt({ hash: configureHash });
+if (configureReceipt.status !== "success") {
+  throw new Error(`设置 OutcomeToken Exchange 失败：${configureHash}`);
+}
 deployment.txs = {
   ...(deployment.txs ?? {}),
   deployExchangeTx: hash,
+  configureExchangeTx: configureHash,
 };
 fs.writeFileSync(deploymentPath, `${JSON.stringify(deployment, null, 2)}\n`);
 
