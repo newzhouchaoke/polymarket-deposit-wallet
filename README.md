@@ -383,6 +383,8 @@ API_WRITE_TOKEN=
 API_READ_RATE_LIMIT_PER_MINUTE=300
 API_WRITE_RATE_LIMIT_PER_MINUTE=30
 API_REALTIME_POLL_MS=2000
+HEALTH_REQUIRE_CHAIN_SYNC=true
+SERVICE_STATUS_STALE_MS=180000
 ```
 
 令牌通过 `Authorization: Bearer ...` 或 `x-api-key` 提交。交易页可以把令牌保存在当前
@@ -396,6 +398,45 @@ npm run test:api
 
 实时通道为 `ws://127.0.0.1:8787/ws?marketId=...`，连接后立即推送市场、订单簿、最近
 订单和成交快照；API 写入或同步数据库变化时会再次推送。交易页会自动连接和重连。
+
+`POST /api/orders` 现在会严格验证 EVM 地址、市场 tokenId、uint256/bytes32 字段、
+签名类型、价格、过期时间和初始成交量。相同订单重复提交返回已有记录，不会把已经部分
+成交或取消的订单重置为 `OPEN`；同一个 `localOrderId` 指向不同订单时返回 HTTP 409。
+
+### 健康检查、指标和故障退避
+
+```bash
+curl http://127.0.0.1:8787/api/health/live
+curl http://127.0.0.1:8787/api/health/ready
+curl http://127.0.0.1:8787/api/metrics
+npm run test:backend
+```
+
+- `live` 表示 API 进程可以响应。
+- `ready` 检查 SQLite、Amoy official-v2 运行时、市场配置和持续同步服务；可通过
+  `HEALTH_REQUIRE_CHAIN_SYNC=false` 在不启动同步器的独立开发环境关闭最后一项。
+- `metrics` 返回 API 内存/运行时长、WebSocket 连接数、订单/成交/事件计数，以及撮合器和
+  同步器状态。
+- 状态文件使用临时文件加原子重命名，避免读取半截 JSON；API 还会核对 PID 和状态更新时间，
+  不再把已经退出或卡住的后台进程显示为“运行中”。
+- 链同步和自动撮合连续失败时采用指数退避，成功后恢复正常间隔：
+
+```dotenv
+CHAIN_SYNC_INTERVAL_MS=12000
+CHAIN_SYNC_MAX_BACKOFF_MS=120000
+MATCHER_INTERVAL_MS=15000
+MATCHER_MAX_BACKOFF_MS=120000
+```
+
+测试或运维需要隔离数据库时可设置绝对路径 `POLYMARKET_DB_PATH`，避免污染当前运行库。
+数据库可执行完整性/外键检查，也可以生成包含当前 WAL 状态的一致性备份：
+
+```bash
+npm run db:check
+npm run db:backup
+```
+
+备份保存在 `data/backups/`，属于本地运行数据，不会提交到 Git。
 
 ### Standard / Neg Risk / UMA 模块状态
 

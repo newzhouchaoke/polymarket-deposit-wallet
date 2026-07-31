@@ -13,15 +13,17 @@ export const dbMode =
   String(process.env.EXCHANGE_MODE ?? "research").trim().toLowerCase() === "official-v2"
     ? "official-v2"
     : "research";
-export const dbPath = path.join(
-  dbDir,
-  dbMode === "official-v2"
-    ? "official-v2-polymarket.sqlite"
-    : "research-polymarket.sqlite",
-);
+export const dbPath = process.env.POLYMARKET_DB_PATH
+  ? path.resolve(process.env.POLYMARKET_DB_PATH)
+  : path.join(
+      dbDir,
+      dbMode === "official-v2"
+        ? "official-v2-polymarket.sqlite"
+        : "research-polymarket.sqlite",
+    );
 
 export function openDatabase() {
-  fs.mkdirSync(dbDir, { recursive: true });
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   db.exec("PRAGMA foreign_keys = ON;");
   db.exec("PRAGMA journal_mode = WAL;");
@@ -297,6 +299,9 @@ export function initSchema(db) {
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_orders_order_hash
       ON orders(chain_id, order_hash);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_order_hash_unique
+      ON orders(chain_id, order_hash)
+      WHERE order_hash IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_order_fills_order_hash
       ON order_fills(chain_id, order_hash);
   `);

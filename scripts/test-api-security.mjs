@@ -1,19 +1,37 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { WebSocket } from "ws";
 import { projectDir } from "./db.js";
+import { loadExchangeConfig } from "./exchange-config.mjs";
 
 const port = 8797;
 const token = "test-write-token";
+const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "polymarket-api-test-"));
+const testDatabasePath = path.join(temporaryDirectory, "api.sqlite");
+const deployment = loadExchangeConfig({ requireMarket: true });
+const commonEnvironment = {
+  ...process.env,
+  POLYMARKET_DB_PATH: testDatabasePath,
+  HEALTH_REQUIRE_CHAIN_SYNC: "false",
+};
+const importResult = spawnSync("node", ["scripts/db-import-runtime.mjs"], {
+  cwd: projectDir,
+  env: commonEnvironment,
+  encoding: "utf8",
+});
+assert.equal(importResult.status, 0, importResult.stderr || importResult.stdout);
 const child = spawn("node", ["scripts/api-server.mjs"], {
   cwd: projectDir,
   env: {
-    ...process.env,
+    ...commonEnvironment,
     API_PORT: String(port),
     API_HOST: "127.0.0.1",
     API_WRITE_TOKEN: token,
     API_READ_RATE_LIMIT_PER_MINUTE: "100",
-    API_WRITE_RATE_LIMIT_PER_MINUTE: "2",
+    API_WRITE_RATE_LIMIT_PER_MINUTE: "6",
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -58,6 +76,72 @@ try {
   await waitForServer();
   const summary = await fetch(`http://127.0.0.1:${port}/api/summary`);
   assert.equal(summary.status, 200);
+  const live = await fetch(`http://127.0.0.1:${port}/api/health/live`);
+  assert.equal(live.status, 200);
+  assert.equal((await live.json()).ok, true);
+  const ready = await fetch(`http://127.0.0.1:${port}/api/health/ready`);
+  assert.equal(ready.status, 200);
+  assert.equal((await ready.json()).checks.database.ok, true);
+  const metrics = await fetch(`http://127.0.0.1:${port}/api/metrics`).then(
+    (response) => response.json(),
+  );
+  assert.equal(metrics.database.health.ok, true);
+
+  const order = {
+    localOrderId: "api-idempotency-test",
+    marketId: deployment.market.marketId,
+    maker: deployment.deployer,
+    signer: deployment.deployer,
+    side: "BUY",
+    tokenId: deployment.market.yesTokenId,
+    makerAmount: "500000",
+    takerAmount: "1000000",
+    expiration: 0,
+    salt: "8675309",
+    signatureType: 0,
+    timestamp: "1785474000",
+  };
+  const created = await fetch(`http://127.0.0.1:${port}/api/orders`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(order),
+  });
+  assert.equal(created.status, 201);
+  assert.equal((await created.json()).idempotent, false);
+
+  const repeated = await fetch(`http://127.0.0.1:${port}/api/orders`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(order),
+  });
+  assert.equal(repeated.status, 200);
+  assert.equal((await repeated.json()).idempotent, true);
+
+  const conflict = await fetch(`http://127.0.0.1:${port}/api/orders`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ ...order, makerAmount: "510000" }),
+  });
+  assert.equal(conflict.status, 409);
+
+  const invalidToken = await fetch(`http://127.0.0.1:${port}/api/orders`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ ...order, localOrderId: "invalid-token", tokenId: "42" }),
+  });
+  assert.equal(invalidToken.status, 400);
 
   const unauthorized = await fetch(
     `http://127.0.0.1:${port}/api/orders/unknown/cancel`,
@@ -92,8 +176,10 @@ try {
   );
   assert.ok(audit.some((row) => row.status_code === 401));
   assert.ok(audit.some((row) => row.status_code === 500));
-  console.log("API auth, rate limit, audit, and WebSocket tests passed");
+  assert.ok(audit.some((row) => row.status_code === 409));
+  console.log("API health, order idempotency, auth, rate limit, audit, and WebSocket tests passed");
 } finally {
   child.kill("SIGTERM");
   await new Promise((resolve) => child.once("exit", resolve));
+  fs.rmSync(temporaryDirectory, { recursive: true, force: true });
 }

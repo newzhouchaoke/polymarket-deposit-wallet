@@ -1,7 +1,13 @@
-import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { dbMode, projectDir } from "./db.js";
+import {
+  atomicWriteJson,
+  backoffDelayMs,
+  createInterruptibleSleeper,
+  readJsonStatus,
+  statusWithLiveness,
+} from "./service-utils.mjs";
 
 export const chainSyncStatusPath = path.join(
   projectDir,
@@ -13,28 +19,30 @@ const intervalMs = Number(process.env.CHAIN_SYNC_INTERVAL_MS ?? "12000");
 const syncChunkSize = String(process.env.SYNC_CHUNK_SIZE ?? "200");
 const syncMaxBlocksPerRun = String(process.env.SYNC_MAX_BLOCKS_PER_RUN ?? "1000");
 const once = process.argv.includes("--once");
+const maxBackoffMs = Number(process.env.CHAIN_SYNC_MAX_BACKOFF_MS ?? "120000");
 
 if (!Number.isInteger(intervalMs) || intervalMs < 3000) {
   throw new Error("CHAIN_SYNC_INTERVAL_MS 必须是 >= 3000 的整数毫秒");
 }
+if (!Number.isInteger(maxBackoffMs) || maxBackoffMs < intervalMs) {
+  throw new Error("CHAIN_SYNC_MAX_BACKOFF_MS 必须是 >= CHAIN_SYNC_INTERVAL_MS 的整数毫秒");
+}
 
 function writeStatus(status) {
-  fs.mkdirSync(path.dirname(chainSyncStatusPath), { recursive: true });
-  fs.writeFileSync(
+  atomicWriteJson(
     chainSyncStatusPath,
-    `${JSON.stringify({ updatedAt: new Date().toISOString(), ...status }, null, 2)}\n`,
+    { updatedAt: new Date().toISOString(), ...status },
   );
 }
 
 function readStatus() {
-  if (!fs.existsSync(chainSyncStatusPath)) {
-    return {
+  return statusWithLiveness(
+    readJsonStatus(chainSyncStatusPath, {
       updatedAt: null,
       running: false,
       message: "链上事件持续同步服务尚未写入状态",
-    };
-  }
-  return JSON.parse(fs.readFileSync(chainSyncStatusPath, "utf8"));
+    }),
+  );
 }
 
 function runCommand(command, args, env = process.env) {
@@ -79,28 +87,43 @@ async function runTick() {
     events,
     balances,
   };
-  writeStatus(status);
   return status;
 }
 
 let stopped = false;
+let consecutiveErrors = 0;
+const sleeper = createInterruptibleSleeper();
 
 async function loop() {
   while (!stopped) {
+    let delayMs = intervalMs;
     try {
       const status = await runTick();
+      consecutiveErrors = 0;
       const eventLine =
         status.events.stdout.split("\n").find((line) => line.includes("同步完成")) ??
         status.events.stdout.split("\n").find((line) => line.includes("已是最新")) ??
         "同步完成";
       console.log(`[chain-sync] ${new Date().toISOString()} ${eventLine}`);
+      writeStatus({
+        ...status,
+        pid: process.pid,
+        consecutiveErrors,
+        lastSuccessAt: new Date().toISOString(),
+      });
       if (once) break;
     } catch (error) {
+      consecutiveErrors += 1;
+      delayMs = backoffDelayMs(consecutiveErrors, intervalMs, maxBackoffMs);
       const previous = readStatus();
       writeStatus({
         ...previous,
         running: !once,
+        pid: process.pid,
         intervalMs,
+        consecutiveErrors,
+        retryDelayMs: delayMs,
+        nextRetryAt: once ? null : new Date(Date.now() + delayMs).toISOString(),
         errorAt: new Date().toISOString(),
         error: error instanceof Error ? error.message : String(error),
       });
@@ -110,7 +133,7 @@ async function loop() {
         break;
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    if (!once && !stopped) await sleeper.sleep(delayMs);
   }
   const previous = readStatus();
   writeStatus({
@@ -132,9 +155,11 @@ writeStatus({
 
 process.on("SIGINT", () => {
   stopped = true;
+  sleeper.wake();
 });
 process.on("SIGTERM", () => {
   stopped = true;
+  sleeper.wake();
 });
 
 await loop();

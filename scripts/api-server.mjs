@@ -5,10 +5,12 @@ import { URL } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
 import { WebSocketServer } from "ws";
+import { getAddress, isHex } from "viem";
 import { dbMode, dbPath, initSchema, openDatabase, projectDir } from "./db.js";
 import { readMatcherStatus } from "./matcher-core.mjs";
 import { orderHashFor, sideNumber } from "./order-utils.mjs";
 import { officialModulesStatus } from "./official-modules-status.mjs";
+import { readJsonStatus, statusWithLiveness } from "./service-utils.mjs";
 import {
   loadExchangeConfig,
   runtimeSummary,
@@ -30,6 +32,8 @@ const writeToken = String(process.env.API_WRITE_TOKEN ?? "").trim();
 const readRateLimit = Number(process.env.API_READ_RATE_LIMIT_PER_MINUTE ?? "300");
 const writeRateLimit = Number(process.env.API_WRITE_RATE_LIMIT_PER_MINUTE ?? "30");
 const realtimePollMs = Number(process.env.API_REALTIME_POLL_MS ?? "2000");
+const healthRequireChainSync =
+  String(process.env.HEALTH_REQUIRE_CHAIN_SYNC ?? "true").toLowerCase() === "true";
 const rateWindows = new Map();
 const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
 
@@ -199,14 +203,13 @@ function internalError(res, error) {
 }
 
 function readChainSyncStatus() {
-  if (!fs.existsSync(chainSyncStatusPath)) {
-    return {
+  return statusWithLiveness(
+    readJsonStatus(chainSyncStatusPath, {
       updatedAt: null,
       running: false,
       message: "链上事件持续同步服务尚未写入状态",
-    };
-  }
-  return JSON.parse(fs.readFileSync(chainSyncStatusPath, "utf8"));
+    }),
+  );
 }
 
 function limit(url, fallback = 100) {
@@ -227,7 +230,7 @@ function readJsonBody(req) {
     req.on("data", (chunk) => {
       body += chunk.toString();
       if (body.length > 1_000_000) {
-        reject(new Error("Request body too large"));
+        reject(Object.assign(new Error("Request body too large"), { statusCode: 413 }));
         req.destroy();
       }
     });
@@ -239,7 +242,7 @@ function readJsonBody(req) {
       try {
         resolve(JSON.parse(body));
       } catch {
-        reject(new Error("Invalid JSON request body"));
+        reject(Object.assign(new Error("Invalid JSON request body"), { statusCode: 400 }));
       }
     });
     req.on("error", reject);
@@ -248,7 +251,7 @@ function readJsonBody(req) {
 
 function requireString(value, name) {
   if (typeof value !== "string" || value.trim() === "") {
-    throw new Error(`${name} is required`);
+    throw Object.assign(new Error(`${name} is required`), { statusCode: 400 });
   }
   return value.trim();
 }
@@ -256,7 +259,10 @@ function requireString(value, name) {
 function requireAmountString(value, name) {
   const text = requireString(String(value ?? ""), name);
   if (!/^\d+$/.test(text) || BigInt(text) <= 0n) {
-    throw new Error(`${name} must be a positive integer string`);
+    throw Object.assign(
+      new Error(`${name} must be a positive integer string`),
+      { statusCode: 400 },
+    );
   }
   return text;
 }
@@ -264,7 +270,7 @@ function requireAmountString(value, name) {
 function normalizeSide(value) {
   if (value === 0 || String(value).toUpperCase() === "BUY") return "BUY";
   if (value === 1 || String(value).toUpperCase() === "SELL") return "SELL";
-  throw new Error("side must be BUY or SELL");
+  throw Object.assign(new Error("side must be BUY or SELL"), { statusCode: 400 });
 }
 
 function priceMicrosForOrder(side, makerAmount, takerAmount) {
@@ -274,7 +280,9 @@ function priceMicrosForOrder(side, makerAmount, takerAmount) {
     ? (maker * 1_000_000n) / taker
     : (taker * 1_000_000n) / maker;
   if (price <= 0n || price >= 1_000_000n) {
-    throw new Error("price must be between 0 and 1");
+    throw Object.assign(new Error("price must be between 0 and 1"), {
+      statusCode: 400,
+    });
   }
   return Number(price);
 }
@@ -298,19 +306,38 @@ function localOrderId(order) {
 }
 
 function insertOrder(order) {
+  const marketId = requireString(order.marketId, "marketId");
   const market = one("SELECT * FROM markets WHERE market_id = :marketId", {
-    marketId: order.marketId,
+    marketId,
   });
-  if (!market) throw new Error(`Unknown marketId: ${order.marketId}`);
-  if (market.status !== "OPEN") throw new Error(`Market is not OPEN: ${market.status}`);
+  if (!market) {
+    throw Object.assign(new Error(`Unknown marketId: ${marketId}`), {
+      statusCode: 400,
+    });
+  }
+  if (market.status !== "OPEN") {
+    throw Object.assign(new Error(`Market is not OPEN: ${market.status}`), {
+      statusCode: 409,
+    });
+  }
 
   const side = normalizeSide(order.side);
   const makerAmount = requireAmountString(order.makerAmount, "makerAmount");
   const takerAmount = requireAmountString(order.takerAmount, "takerAmount");
+  let maker;
+  let signer;
+  try {
+    maker = getAddress(requireString(order.maker, "maker"));
+    signer = getAddress(requireString(order.signer ?? order.maker, "signer"));
+  } catch {
+    throw Object.assign(new Error("maker and signer must be valid EVM addresses"), {
+      statusCode: 400,
+    });
+  }
   const normalized = {
-    marketId: requireString(order.marketId, "marketId"),
-    maker: requireString(order.maker, "maker"),
-    signer: requireString(order.signer ?? order.maker, "signer"),
+    marketId,
+    maker,
+    signer,
     side,
     tokenId: requireString(order.tokenId ?? market.yes_token_id, "tokenId"),
     makerAmount,
@@ -326,8 +353,53 @@ function insertOrder(order) {
     filledMakerAmount: String(order.filledMakerAmount ?? order.filled_maker_amount ?? "0"),
     filledTakerAmount: String(order.filledTakerAmount ?? order.filled_taker_amount ?? "0"),
   };
-  if (!["OPEN", "PARTIALLY_FILLED", "FILLED", "CANCELLED", "EXPIRED", "FAILED"].includes(normalized.status)) {
-    throw new Error("Invalid order status");
+  if (![market.yes_token_id, market.no_token_id].includes(normalized.tokenId)) {
+    throw Object.assign(new Error("tokenId does not belong to this market"), {
+      statusCode: 400,
+    });
+  }
+  if (!Number.isInteger(normalized.expiration) || normalized.expiration < 0) {
+    throw Object.assign(new Error("expiration must be a non-negative integer"), {
+      statusCode: 400,
+    });
+  }
+  if (normalized.expiration !== 0 && normalized.expiration <= Math.floor(Date.now() / 1000)) {
+    throw Object.assign(new Error("expiration must be zero or in the future"), {
+      statusCode: 400,
+    });
+  }
+  if (
+    !Number.isInteger(normalized.signatureType) ||
+    normalized.signatureType < 0 ||
+    normalized.signatureType > 3
+  ) {
+    throw Object.assign(new Error("signatureType must be 0, 1, 2, or 3"), {
+      statusCode: 400,
+    });
+  }
+  if (!/^\d+$/.test(normalized.salt) || !/^\d+$/.test(normalized.timestamp)) {
+    throw Object.assign(new Error("salt and timestamp must be uint256 strings"), {
+      statusCode: 400,
+    });
+  }
+  if (!/^0x[0-9a-fA-F]{64}$/.test(normalized.metadata)) {
+    throw Object.assign(new Error("metadata must be bytes32"), { statusCode: 400 });
+  }
+  if (!/^0x[0-9a-fA-F]{64}$/.test(normalized.builder)) {
+    throw Object.assign(new Error("builder must be bytes32"), { statusCode: 400 });
+  }
+  if (
+    normalized.signature !== null &&
+    (!isHex(normalized.signature) || normalized.signature.length % 2 !== 0)
+  ) {
+    throw Object.assign(new Error("signature must be an even-length hex value"), {
+      statusCode: 400,
+    });
+  }
+  if (normalized.status !== "OPEN") {
+    throw Object.assign(new Error("new API orders must start in OPEN status"), {
+      statusCode: 400,
+    });
   }
 
   const id = typeof order.localOrderId === "string" && order.localOrderId.trim()
@@ -335,7 +407,14 @@ function insertOrder(order) {
     : localOrderId(normalized);
   const priceMicros = priceMicrosForOrder(side, makerAmount, takerAmount);
   if (!/^\d+$/.test(normalized.filledMakerAmount) || !/^\d+$/.test(normalized.filledTakerAmount)) {
-    throw new Error("filled amounts must be integer strings");
+    throw Object.assign(new Error("filled amounts must be integer strings"), {
+      statusCode: 400,
+    });
+  }
+  if (normalized.filledMakerAmount !== "0" || normalized.filledTakerAmount !== "0") {
+    throw Object.assign(new Error("new API orders must have zero filled amounts"), {
+      statusCode: 400,
+    });
   }
   assertFillWithinOrder(
     { maker_amount: makerAmount, taker_amount: takerAmount },
@@ -358,6 +437,26 @@ function insertOrder(order) {
   const orderHash = orderHashFor(exchangeConfig, contractOrder);
   normalized.orderHash = orderHash;
 
+  const existingById = one(
+    "SELECT * FROM orders WHERE chain_id = :chainId AND local_order_id = :id",
+    { chainId: market.chain_id, id },
+  );
+  if (existingById) {
+    if (existingById.order_hash?.toLowerCase() === orderHash.toLowerCase()) {
+      return { ...existingById, idempotent: true };
+    }
+    throw Object.assign(
+      new Error(`localOrderId already belongs to a different order: ${id}`),
+      { statusCode: 409 },
+    );
+  }
+  const existingByHash = one(
+    `SELECT * FROM orders
+     WHERE chain_id = :chainId AND lower(order_hash) = lower(:orderHash)`,
+    { chainId: market.chain_id, orderHash },
+  );
+  if (existingByHash) return { ...existingByHash, idempotent: true };
+
   db.prepare(
     `INSERT INTO orders(
        chain_id, local_order_id, market_id, maker, signer, side, token_id,
@@ -368,25 +467,7 @@ function insertOrder(order) {
        :chainId, :localOrderId, :marketId, :maker, :signer, :side, :tokenId,
        :makerAmount, :takerAmount, :filledMakerAmount, :filledTakerAmount,
        :priceMicros, :status, :expiration, :salt, :signature, :orderHash, :rawJson, CURRENT_TIMESTAMP
-     )
-     ON CONFLICT(chain_id, local_order_id) DO UPDATE SET
-       market_id=excluded.market_id,
-       maker=excluded.maker,
-       signer=excluded.signer,
-       side=excluded.side,
-       token_id=excluded.token_id,
-       maker_amount=excluded.maker_amount,
-       taker_amount=excluded.taker_amount,
-       filled_maker_amount=excluded.filled_maker_amount,
-       filled_taker_amount=excluded.filled_taker_amount,
-       price_micros=excluded.price_micros,
-       status=excluded.status,
-       expiration=excluded.expiration,
-       salt=excluded.salt,
-       signature=excluded.signature,
-       order_hash=excluded.order_hash,
-       raw_json=excluded.raw_json,
-       updated_at=excluded.updated_at`,
+     )`,
   ).run({
     chainId: market.chain_id,
     localOrderId: id,
@@ -408,7 +489,10 @@ function insertOrder(order) {
     rawJson: JSON.stringify(normalized),
   });
 
-  return one("SELECT * FROM orders WHERE local_order_id = :id", { id });
+  return {
+    ...one("SELECT * FROM orders WHERE local_order_id = :id", { id }),
+    idempotent: false,
+  };
 }
 
 function orderById(localOrderId) {
@@ -701,6 +785,9 @@ function indexPage() {
     ["/api/order-fills", "逐订单链上成交"],
     ["/api/audit", "API 写操作审计"],
     ["/api/modules", "Standard / Neg Risk / UMA 状态"],
+    ["/api/health/live", "API 存活检查"],
+    ["/api/health/ready", "数据库/运行时/同步就绪检查"],
+    ["/api/metrics", "服务与数据库指标"],
     ["/api/balances", "余额"],
     ["/api/events", "链上事件"],
     ["/api/matcher/status", "自动撮合状态"],
@@ -1560,7 +1647,90 @@ function orderbookForMarket(marketId) {
   return { marketId, activeStatuses, bids, asks };
 }
 
+function databaseHealth() {
+  try {
+    const result = db.prepare("PRAGMA quick_check").get();
+    return {
+      ok: result?.quick_check === "ok",
+      result: result?.quick_check ?? "unknown",
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      result: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function readiness() {
+  const database = databaseHealth();
+  const chainSync = readChainSyncStatus();
+  const checks = {
+    database,
+    exchange: {
+      ok: Boolean(exchangeRuntime.exchange && exchangeRuntime.chainId === 80002),
+      mode: exchangeRuntime.mode,
+      chainId: exchangeRuntime.chainId,
+      address: exchangeRuntime.exchange,
+    },
+    market: {
+      ok: Boolean(exchangeRuntime.marketConfigured && exchangeRuntime.marketId),
+      marketId: exchangeRuntime.marketId,
+    },
+    chainSync: {
+      required: healthRequireChainSync,
+      ok: !healthRequireChainSync || chainSync.running,
+      running: chainSync.running,
+      processAlive: chainSync.processAlive,
+      stale: chainSync.stale,
+      updatedAt: chainSync.updatedAt,
+    },
+  };
+  return {
+    ok: Object.values(checks).every((check) => check.ok),
+    checkedAt: new Date().toISOString(),
+    checks,
+  };
+}
+
+function serviceMetrics() {
+  const memory = process.memoryUsage();
+  return {
+    generatedAt: new Date().toISOString(),
+    api: {
+      pid: process.pid,
+      uptimeSeconds: Math.floor(process.uptime()),
+      websocketClients: websocketServer.clients.size,
+      rateLimitBuckets: rateWindows.size,
+      memoryBytes: {
+        rss: memory.rss,
+        heapUsed: memory.heapUsed,
+        heapTotal: memory.heapTotal,
+      },
+    },
+    database: {
+      path: dbPath,
+      health: databaseHealth(),
+      orders: one("SELECT COUNT(*) AS count FROM orders").count,
+      openOrders: one(
+        `SELECT COUNT(*) AS count FROM orders
+         WHERE status IN ('OPEN', 'PARTIALLY_FILLED')`,
+      ).count,
+      trades: one("SELECT COUNT(*) AS count FROM trades").count,
+      chainEvents: one("SELECT COUNT(*) AS count FROM chain_events").count,
+    },
+    matcher: readMatcherStatus(),
+    chainSync: readChainSyncStatus(),
+  };
+}
+
 const routes = {
+  "/api/health/live": () => ({
+    ok: true,
+    checkedAt: new Date().toISOString(),
+    pid: process.pid,
+    uptimeSeconds: Math.floor(process.uptime()),
+  }),
   "/api/summary": () => ({
     dbPath,
     runtime: exchangeRuntime,
@@ -1705,6 +1875,7 @@ const routes = {
   },
   "/api/matcher/status": () => readMatcherStatus(),
   "/api/chain-sync/status": () => readChainSyncStatus(),
+  "/api/metrics": () => serviceMetrics(),
 };
 
 const websocketServer = new WebSocketServer({ noServer: true });
@@ -1863,7 +2034,12 @@ const server = http.createServer(async (req, res) => {
       }
       if (url.pathname === "/api/orders") {
         requestBody = await readJsonBody(req);
-        return respondAction(201, "ORDER_CREATE", insertOrder(requestBody));
+        const result = insertOrder(requestBody);
+        return respondAction(
+          result.idempotent ? 200 : 201,
+          result.idempotent ? "ORDER_CREATE_IDEMPOTENT" : "ORDER_CREATE",
+          result,
+        );
       }
       const marketAction = marketActionPath(url.pathname);
       if (marketAction) {
@@ -1975,6 +2151,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     const route = routes[url.pathname];
+    if (url.pathname === "/api/health/ready") {
+      const result = readiness();
+      return json(res, result.ok ? 200 : 503, result);
+    }
     if (url.pathname === "/api/modules") {
       return json(res, 200, await officialModulesStatus());
     }
@@ -1999,6 +2179,17 @@ const server = http.createServer(async (req, res) => {
     if (statusCode === 401) {
       return json(res, 401, {
         error: "UNAUTHORIZED",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+    if ([400, 409, 413].includes(statusCode)) {
+      const names = {
+        400: "BAD_REQUEST",
+        409: "CONFLICT",
+        413: "PAYLOAD_TOO_LARGE",
+      };
+      return json(res, statusCode, {
+        error: names[statusCode],
         message: error instanceof Error ? error.message : String(error),
       });
     }
@@ -2058,6 +2249,14 @@ const websocketHeartbeat = setInterval(() => {
 }, 30_000);
 websocketHeartbeat.unref();
 
+const rateLimitCleanup = setInterval(() => {
+  const cutoff = Date.now() - 60_000;
+  for (const [key, value] of rateWindows) {
+    if (value.startedAt < cutoff) rateWindows.delete(key);
+  }
+}, 60_000);
+rateLimitCleanup.unref();
+
 server.listen(port, host, () => {
   console.log(
     `Polymarket ${exchangeRuntime.mode} API 已启动：http://${host}:${port}`,
@@ -2065,12 +2264,22 @@ server.listen(port, host, () => {
   console.log(`数据库：${dbPath}`);
 });
 
+let shuttingDown = false;
 function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   clearInterval(realtimePoll);
   clearInterval(websocketHeartbeat);
+  clearInterval(rateLimitCleanup);
   for (const socket of websocketServer.clients) socket.close(1001, "server shutdown");
   websocketServer.close();
+  const forceExit = setTimeout(() => {
+    db.close();
+    process.exit(1);
+  }, 5_000);
+  forceExit.unref();
   server.close(() => {
+    clearTimeout(forceExit);
     db.close();
     process.exit(0);
   });

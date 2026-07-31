@@ -13,6 +13,11 @@ import {
   upsert,
 } from "./order-utils.mjs";
 import { dbMode } from "./db.js";
+import {
+  atomicWriteJson,
+  readJsonStatus,
+  statusWithLiveness,
+} from "./service-utils.mjs";
 
 export const matcherStatusPath = path.join(
   projectDir,
@@ -53,22 +58,20 @@ function compactError(error) {
 }
 
 export function writeMatcherStatus(status) {
-  fs.mkdirSync(path.dirname(matcherStatusPath), { recursive: true });
-  fs.writeFileSync(
+  atomicWriteJson(
     matcherStatusPath,
-    `${JSON.stringify({ updatedAt: new Date().toISOString(), ...status }, null, 2)}\n`,
+    { updatedAt: new Date().toISOString(), ...status },
   );
 }
 
 export function readMatcherStatus() {
-  if (!fs.existsSync(matcherStatusPath)) {
-    return {
+  return statusWithLiveness(
+    readJsonStatus(matcherStatusPath, {
       updatedAt: null,
       running: false,
       message: "自动撮合服务尚未写入状态",
-    };
-  }
-  return JSON.parse(fs.readFileSync(matcherStatusPath, "utf8"));
+    }),
+  );
 }
 
 export function bestMatch(db, maxMakers = Number(process.env.MATCHER_MAX_MAKERS ?? "5")) {
