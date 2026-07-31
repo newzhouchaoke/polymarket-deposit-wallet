@@ -386,6 +386,8 @@ API_REALTIME_POLL_MS=2000
 API_REQUIRE_SIGNED_ORDERS=true
 API_VALIDATE_SIGNED_ORDERS=true
 API_ENFORCE_BALANCE_RESERVATIONS=true
+RISK_AUDIT_INTERVAL_MS=30000
+MATCHER_ENFORCE_RISK=true
 ORDER_EXPIRY_SWEEP_MS=10000
 HEALTH_REQUIRE_CHAIN_SYNC=true
 SERVICE_STATUS_STALE_MS=180000
@@ -423,6 +425,26 @@ curl "http://127.0.0.1:8787/api/reservations"
 curl "http://127.0.0.1:8787/api/reservations?wallet=0x..."
 npm run test:risk
 ```
+
+API 默认每 30 秒重新读取活动预占对应的 Amoy 余额和授权，将每笔预占标记为：
+
+- `COVERED`：链上容量可以覆盖，允许进入自动撮合。
+- `OVERCOMMITTED`：同一资产的累计活动订单超过链上容量，撮合器跳过。
+- `CHECK_FAILED`：RPC 检查失败，按安全策略暂不撮合。
+- `UNCHECKED`：订单或成交量刚发生变化，等待重新巡检。
+- `RELEASED`：订单已经结束，不再占用资金。
+
+同一钱包、同一资产按预占创建时间分配容量，较早订单优先。自动撮合每轮提交前还会强制
+执行一次巡检，因此即使用户在下单后转走资产或撤销授权，也不会继续选择已经失去资金
+覆盖的订单。手动检查和 API 状态：
+
+```bash
+npm run orders:risk:audit
+curl http://127.0.0.1:8787/api/risk/status
+curl -X POST http://127.0.0.1:8787/api/risk/refresh
+```
+
+手动刷新属于受保护的 POST 接口；配置了 `API_WRITE_TOKEN` 时需要携带 Bearer token。
 
 订单保存 `VALID`、`INVALID`、`LOCALLY_SIGNED`、`LEGACY_SIGNED`、`UNSIGNED` 或
 `VALIDATION_SKIPPED` 校验状态。现有活动签名订单可以批量重新校验：
@@ -472,8 +494,9 @@ npm run test:backend
 ```
 
 - `live` 表示 API 进程可以响应。
-- `ready` 检查 SQLite、Amoy official-v2 运行时、市场配置和持续同步服务；可通过
-  `HEALTH_REQUIRE_CHAIN_SYNC=false` 在不启动同步器的独立开发环境关闭最后一项。
+- `ready` 检查 SQLite、Amoy official-v2 运行时、市场配置、持续同步服务和资金巡检；
+  存在活动预占但 RPC 巡检全部失败时会返回未就绪，防止上游继续发送可撮合流量。可通过
+  `HEALTH_REQUIRE_CHAIN_SYNC=false` 在不启动同步器的独立开发环境关闭链同步检查。
 - `metrics` 返回 API 内存/运行时长、WebSocket 连接数、订单/成交/事件计数，以及撮合器和
   同步器状态。
 - 状态文件使用临时文件加原子重命名，避免读取半截 JSON；API 还会核对 PID 和状态更新时间，

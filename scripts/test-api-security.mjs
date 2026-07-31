@@ -119,6 +119,10 @@ try {
     `http://127.0.0.1:${port}/api/orders/stats`,
   ).then((response) => response.json());
   assert.ok(Array.isArray(initialStats.byValidation));
+  const riskStatus = await fetch(
+    `http://127.0.0.1:${port}/api/risk/status`,
+  ).then((response) => response.json());
+  assert.equal(riskStatus.enforced, false);
 
   const order = {
     localOrderId: "api-idempotency-test",
@@ -245,6 +249,7 @@ try {
   const snapshot = await websocketSnapshot();
   assert.equal(snapshot.runtime.mode, "official-v2");
   assert.equal(snapshot.orderbook.marketId, snapshot.market.market_id);
+  assert.equal(snapshot.riskAudit.enforced, false);
 
   const audit = await fetch(`http://127.0.0.1:${port}/api/audit?limit=5`).then(
     (response) => response.json(),

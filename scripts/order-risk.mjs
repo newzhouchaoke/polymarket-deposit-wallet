@@ -14,6 +14,16 @@ function amount(value, name) {
   return BigInt(text);
 }
 
+function compactError(error) {
+  return (
+    error && typeof error === "object" && typeof error.shortMessage === "string"
+      ? error.shortMessage
+      : error instanceof Error
+        ? error.message
+        : String(error)
+  ).replace(/\s+/g, " ").trim();
+}
+
 function rpcUrls() {
   const configured = process.env.AMOY_RPC_URLS || process.env.AMOY_RPC_URL;
   const preferred = configured
@@ -71,12 +81,13 @@ export function syncOrderReservation(db, localOrderId, chainId) {
   db.prepare(
     `INSERT INTO order_reservations(
        chain_id, local_order_id, wallet_address, asset_type, token_id,
-       original_amount, reserved_amount, status, release_reason, updated_at
+       original_amount, reserved_amount, status, release_reason, risk_status,
+       created_at, updated_at
      )
      VALUES(
        :chainId, :localOrderId, :walletAddress, :assetType, :tokenId,
-       :originalAmount, :reservedAmount, :status, :releaseReason,
-       CURRENT_TIMESTAMP
+       :originalAmount, :reservedAmount, :status, :releaseReason, :riskStatus,
+       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
      )
      ON CONFLICT(chain_id, local_order_id) DO UPDATE SET
        wallet_address = excluded.wallet_address,
@@ -86,6 +97,22 @@ export function syncOrderReservation(db, localOrderId, chainId) {
        reserved_amount = excluded.reserved_amount,
        status = excluded.status,
        release_reason = excluded.release_reason,
+       risk_status = CASE
+         WHEN excluded.status = 'RELEASED' THEN 'RELEASED'
+         WHEN order_reservations.status <> excluded.status
+           OR order_reservations.wallet_address <> excluded.wallet_address
+           OR order_reservations.asset_type <> excluded.asset_type
+           OR order_reservations.token_id <> excluded.token_id
+           OR order_reservations.reserved_amount <> excluded.reserved_amount
+           THEN 'UNCHECKED'
+         ELSE order_reservations.risk_status
+       END,
+       risk_error = CASE
+         WHEN excluded.status = 'RELEASED'
+           OR order_reservations.reserved_amount <> excluded.reserved_amount
+           THEN NULL
+         ELSE order_reservations.risk_error
+       END,
        updated_at = CURRENT_TIMESTAMP`,
   ).run({
     chainId: spec.chainId,
@@ -97,6 +124,7 @@ export function syncOrderReservation(db, localOrderId, chainId) {
     reservedAmount: spec.reservedAmount.toString(),
     status: spec.status,
     releaseReason: spec.releaseReason,
+    riskStatus: spec.status === "ACTIVE" ? "UNCHECKED" : "RELEASED",
   });
   return spec;
 }
@@ -113,6 +141,8 @@ export function syncAllReservations(db) {
      SET status = 'RELEASED',
          reserved_amount = '0',
          release_reason = 'ORDER_REMOVED',
+         risk_status = 'RELEASED',
+         risk_error = NULL,
          updated_at = CURRENT_TIMESTAMP
      WHERE NOT EXISTS (
        SELECT 1 FROM orders
@@ -220,9 +250,29 @@ export function reservationSummary(db, walletAddress) {
       tokenId: row.token_id,
       reservedAmount: 0n,
       orderCount: 0,
+      riskStatuses: {},
+      chainCapacity: row.chain_capacity,
+      chainBalance: row.chain_balance,
+      chainAllowance: row.chain_allowance,
+      approvedForAll:
+        row.approved_for_all === null ? null : Boolean(row.approved_for_all),
+      lastCheckedAt: row.last_checked_at,
     };
     current.reservedAmount += amount(row.reserved_amount, "reserved_amount");
     current.orderCount += 1;
+    current.riskStatuses[row.risk_status] =
+      (current.riskStatuses[row.risk_status] ?? 0) + 1;
+    if (
+      row.last_checked_at &&
+      (!current.lastCheckedAt || row.last_checked_at > current.lastCheckedAt)
+    ) {
+      current.chainCapacity = row.chain_capacity;
+      current.chainBalance = row.chain_balance;
+      current.chainAllowance = row.chain_allowance;
+      current.approvedForAll =
+        row.approved_for_all === null ? null : Boolean(row.approved_for_all);
+      current.lastCheckedAt = row.last_checked_at;
+    }
     grouped.set(key, current);
   }
   return {
@@ -233,6 +283,143 @@ export function reservationSummary(db, walletAddress) {
     })),
     reservations,
   };
+}
+
+export function recordReservationRisk(db, localOrderId, chainId, snapshot, riskStatus) {
+  const status = String(riskStatus).toUpperCase();
+  if (!["COVERED", "OVERCOMMITTED", "CHECK_FAILED"].includes(status)) {
+    throw new Error(`未知 riskStatus：${riskStatus}`);
+  }
+  const result = db.prepare(
+    `UPDATE order_reservations
+     SET risk_status = :riskStatus,
+         chain_capacity = :chainCapacity,
+         chain_balance = :chainBalance,
+         chain_allowance = :chainAllowance,
+         approved_for_all = :approvedForAll,
+         risk_error = :riskError,
+         last_checked_at = CURRENT_TIMESTAMP,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE chain_id = :chainId
+       AND local_order_id = :localOrderId
+       AND status = 'ACTIVE'`,
+  ).run({
+    chainId: Number(chainId),
+    localOrderId,
+    riskStatus: status,
+    chainCapacity: snapshot?.capacity?.toString() ?? null,
+    chainBalance: snapshot?.balance?.toString() ?? null,
+    chainAllowance: snapshot?.allowance?.toString() ?? null,
+    approvedForAll:
+      snapshot?.approvedForAll === null || snapshot?.approvedForAll === undefined
+        ? null
+        : snapshot.approvedForAll
+          ? 1
+          : 0,
+    riskError: snapshot?.error ?? null,
+  });
+  return Number(result.changes ?? 0);
+}
+
+export async function auditActiveReservations(
+  db,
+  runtime,
+  client = createRiskPublicClient(),
+) {
+  syncAllReservations(db);
+  const reservations = db.prepare(
+    `SELECT *
+     FROM order_reservations
+     WHERE status = 'ACTIVE'
+     ORDER BY chain_id, lower(wallet_address), asset_type, token_id,
+              created_at, local_order_id`,
+  ).all();
+  const groups = new Map();
+  for (const row of reservations) {
+    const key = [
+      row.chain_id,
+      row.wallet_address.toLowerCase(),
+      row.asset_type,
+      row.token_id,
+    ].join(":");
+    const group = groups.get(key) ?? [];
+    group.push(row);
+    groups.set(key, group);
+  }
+
+  const result = {
+    checkedAt: new Date().toISOString(),
+    groups: groups.size,
+    reservations: reservations.length,
+    covered: 0,
+    overcommitted: 0,
+    checkFailed: 0,
+    details: [],
+  };
+  for (const [key, group] of groups) {
+    const first = group[0];
+    const spec = {
+      chainId: Number(first.chain_id),
+      walletAddress: getAddress(first.wallet_address),
+      assetType: first.asset_type,
+      tokenId: first.token_id,
+    };
+    try {
+      const snapshot = await readChainCapacity(runtime, spec, client);
+      let cumulative = 0n;
+      const orders = [];
+      for (const row of group) {
+        cumulative += amount(row.reserved_amount, "reserved_amount");
+        const covered = cumulative <= snapshot.capacity;
+        recordReservationRisk(
+          db,
+          row.local_order_id,
+          row.chain_id,
+          snapshot,
+          covered ? "COVERED" : "OVERCOMMITTED",
+        );
+        if (covered) result.covered += 1;
+        else result.overcommitted += 1;
+        orders.push({
+          localOrderId: row.local_order_id,
+          reservedAmount: row.reserved_amount,
+          cumulativeReserved: cumulative.toString(),
+          riskStatus: covered ? "COVERED" : "OVERCOMMITTED",
+        });
+      }
+      result.details.push({
+        key,
+        walletAddress: spec.walletAddress,
+        assetType: spec.assetType,
+        tokenId: spec.tokenId,
+        capacity: snapshot.capacity.toString(),
+        balance: snapshot.balance.toString(),
+        allowance: snapshot.allowance?.toString() ?? null,
+        approvedForAll: snapshot.approvedForAll,
+        orders,
+      });
+    } catch (error) {
+      const message = compactError(error);
+      for (const row of group) {
+        recordReservationRisk(
+          db,
+          row.local_order_id,
+          row.chain_id,
+          { error: message },
+          "CHECK_FAILED",
+        );
+        result.checkFailed += 1;
+      }
+      result.details.push({
+        key,
+        walletAddress: spec.walletAddress,
+        assetType: spec.assetType,
+        tokenId: spec.tokenId,
+        error: message,
+      });
+    }
+  }
+  return result;
 }
 
 export function createRiskPublicClient() {

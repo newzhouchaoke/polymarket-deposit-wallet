@@ -56,6 +56,7 @@
     "api:restart": "node scripts/api-restart.mjs",
     "orders:seed:signed": "node scripts/seed-signed-orders.mjs",
     "orders:validate": "node scripts/validate-open-orders.mjs",
+    "orders:risk:audit": "node scripts/audit-order-risk.mjs",
     "orders:match": "node scripts/match-orders.mjs",
     "matcher": "LIVE_ACTION=MATCH_ORDERS LIVE_CONFIRMATION=AMOY_TESTNET_ONLY node scripts/matcher-service.mjs",
     "matcher:once": "LIVE_ACTION=MATCH_ORDERS LIVE_CONFIRMATION=AMOY_TESTNET_ONLY node scripts/matcher-service.mjs --once",

@@ -43,7 +43,8 @@ console.log("\nReservations");
 console.table(
   all(
     `SELECT local_order_id, wallet_address, asset_type, token_id,
-            reserved_amount, status, release_reason
+            reserved_amount, status, risk_status, chain_capacity,
+            last_checked_at, release_reason
      FROM order_reservations
      ORDER BY updated_at DESC`,
   ),

@@ -12,8 +12,10 @@ import { expireOrders, orderStats } from "./order-maintenance.mjs";
 import { orderHashFor, sideNumber } from "./order-utils.mjs";
 import { validateSignedOrder } from "./order-validation.mjs";
 import {
+  auditActiveReservations,
   assertReservationCapacity,
   readChainCapacity,
+  recordReservationRisk,
   reservationSpec,
   reservationSummary,
   syncAllReservations,
@@ -58,6 +60,9 @@ const enforceBalanceReservations =
       (exchangeRuntime.mode === "official-v2" ? "true" : "false"),
   ).toLowerCase() === "true";
 const orderExpirySweepMs = Number(process.env.ORDER_EXPIRY_SWEEP_MS ?? "10000");
+const riskAuditIntervalMs = Number(
+  process.env.RISK_AUDIT_INTERVAL_MS ?? "30000",
+);
 const rateWindows = new Map();
 const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
 
@@ -71,6 +76,69 @@ if (!Number.isInteger(realtimePollMs) || realtimePollMs < 500) {
 }
 if (!Number.isInteger(orderExpirySweepMs) || orderExpirySweepMs < 1000) {
   throw new Error("ORDER_EXPIRY_SWEEP_MS 必须是 >= 1000 的整数毫秒");
+}
+if (!Number.isInteger(riskAuditIntervalMs) || riskAuditIntervalMs < 5000) {
+  throw new Error("RISK_AUDIT_INTERVAL_MS 必须是 >= 5000 的整数毫秒");
+}
+
+let riskAuditState = {
+  running: false,
+  enforced: enforceBalanceReservations,
+  intervalMs: riskAuditIntervalMs,
+  lastStartedAt: null,
+  lastFinishedAt: null,
+  lastResult: null,
+  lastError: null,
+};
+let riskAuditPromise = null;
+
+async function runRiskAudit(trigger = "manual") {
+  if (riskAuditPromise) return riskAuditPromise;
+  if (!enforceBalanceReservations) {
+    riskAuditState = {
+      ...riskAuditState,
+      running: false,
+      trigger,
+      lastStartedAt: new Date().toISOString(),
+      lastFinishedAt: new Date().toISOString(),
+      lastResult: {
+        skipped: true,
+        reason: "API_ENFORCE_BALANCE_RESERVATIONS=false",
+      },
+      lastError: null,
+    };
+    return riskAuditState;
+  }
+  riskAuditState = {
+    ...riskAuditState,
+    running: true,
+    lastStartedAt: new Date().toISOString(),
+    lastError: null,
+    trigger,
+  };
+  riskAuditPromise = auditActiveReservations(db, exchangeConfig)
+    .then((result) => {
+      riskAuditState = {
+        ...riskAuditState,
+        running: false,
+        lastFinishedAt: new Date().toISOString(),
+        lastResult: result,
+      };
+      return riskAuditState;
+    })
+    .catch((error) => {
+      riskAuditState = {
+        ...riskAuditState,
+        running: false,
+        lastFinishedAt: new Date().toISOString(),
+        lastError: error instanceof Error ? error.message : String(error),
+      };
+      throw error;
+    })
+    .finally(() => {
+      riskAuditPromise = null;
+    });
+  return riskAuditPromise;
 }
 
 function rows(sql, params = {}) {
@@ -553,9 +621,11 @@ async function insertOrder(order) {
     status: normalized.status,
   });
   let chainRisk = null;
+  let chainCapacitySnapshot = null;
   if (enforceBalanceReservations) {
     try {
       const chainCapacity = await readChainCapacity(exchangeConfig, candidateSpec);
+      chainCapacitySnapshot = chainCapacity;
       chainRisk = {
         ...assertReservationCapacity(db, candidateSpec, chainCapacity.capacity),
         balance: chainCapacity.balance.toString(),
@@ -599,6 +669,15 @@ async function insertOrder(order) {
        )`,
     ).run(insertParams);
     syncOrderReservation(db, id, market.chain_id);
+    if (chainCapacitySnapshot) {
+      recordReservationRisk(
+        db,
+        id,
+        market.chain_id,
+        chainCapacitySnapshot,
+        "COVERED",
+      );
+    }
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");
@@ -909,6 +988,7 @@ function indexPage() {
     ["/api/orders", "订单"],
     ["/api/orders/stats", "订单状态与签名校验统计"],
     ["/api/reservations", "活动订单资金预占"],
+    ["/api/risk/status", "持续资金风险巡检"],
     ["/api/markets/:id/orderbook", "指定市场订单簿"],
     ["/api/orderbook", "订单簿"],
     ["/api/trades", "成交"],
@@ -1046,6 +1126,7 @@ function tradePage() {
       <a href="${escapeHtml(orderbookPath)}">订单簿 JSON</a>
       <a href="/api/matcher/status">撮合服务状态</a>
       <a href="/api/chain-sync/status">链上同步状态</a>
+      <a href="/api/risk/status">资金风险状态</a>
       <a href="/api/events?eventName=OrdersMatched">撮合事件</a>
       <a href="/api/events?eventName=OrderCancelled">取消事件</a>
     </div>
@@ -1058,6 +1139,7 @@ function tradePage() {
     <div class="card"><div class="label">卖方钱包</div><div class="value mono" id="metric-seller">${escapeHtml(short(seller, 8))}</div></div>
     <div class="card"><div class="label">自动撮合</div><div class="value" id="metric-matcher">加载中</div></div>
     <div class="card"><div class="label">链上同步</div><div class="value" id="metric-chain-sync">加载中</div></div>
+    <div class="card"><div class="label">资金风险</div><div class="value" id="metric-risk">加载中</div></div>
     <div class="card"><div class="label">实时推送</div><div class="value" id="metric-realtime">连接中</div></div>
   </section>
 
@@ -1090,6 +1172,7 @@ function tradePage() {
         <p class="muted small">页面会通过 EIP-6963 明确选择 MetaMask，不使用 Phantom 注入的默认 Provider；连接后自动切换 Polygon Amoy。浏览器签名支持 EOA(0) 和官方 Proxy(1)。</p>
         <button id="connect-wallet" type="button">连接 MetaMask</button>
         <button id="refresh-wallet-assets" type="button" class="secondary">刷新余额/授权</button>
+        <button id="refresh-risk" type="button" class="secondary">执行资金巡检</button>
         <div id="wallet-status" class="status">尚未连接钱包</div>
         <pre id="wallet-assets">连接后显示账户 POL、Maker pUSD、结果代币余额和 Exchange 授权。</pre>
       </div>
@@ -1530,13 +1613,14 @@ function tradePage() {
     async function refresh() {
       const market = activeMarket();
       const marketId = encodeURIComponent(market.market_id || "");
-      const [book, orders, trades, balances, matcher, chainSync, latestMarkets] = await Promise.all([
+      const [book, orders, trades, balances, matcher, chainSync, risk, latestMarkets] = await Promise.all([
         fetch("/api/orderbook?marketId=" + marketId).then((r) => r.json()),
         fetch("/api/orders?marketId=" + marketId + "&limit=30").then((r) => r.json()),
         fetch("/api/trades?marketId=" + marketId + "&limit=20").then((r) => r.json()),
         fetch("/api/balances").then((r) => r.json()),
         fetch("/api/matcher/status").then((r) => r.json()),
         fetch("/api/chain-sync/status").then((r) => r.json()),
+        fetch("/api/risk/status").then((r) => r.json()),
         fetch("/api/markets").then((r) => r.json()),
       ]);
       const latestMarket = latestMarkets.find((item) => item.market_id === market.market_id);
@@ -1544,10 +1628,26 @@ function tradePage() {
       document.querySelector("#metric-market").textContent = shortText(market.market_id || "无市场", 8);
       document.querySelector("#metric-matcher").textContent = matcher.running ? "运行中" : "未运行";
       document.querySelector("#metric-chain-sync").textContent = chainSync.running ? "运行中" : "未运行";
+      const riskResult = risk.lastResult || {};
+      document.querySelector("#metric-risk").textContent = risk.running
+        ? "巡检中"
+        : riskResult.checkFailed
+          ? "检查失败 " + riskResult.checkFailed
+          : riskResult.overcommitted
+            ? "超额 " + riskResult.overcommitted
+            : riskResult.skipped
+              ? "未启用"
+              : "正常";
       marketInfo.innerHTML = '<div><b>' + (market.question || "无市场") + '</b></div>'
         + '<div class="small muted">状态：' + (market.status || "-") + ' · YES ' + shortText(market.yes_token_id, 10) + ' · NO ' + shortText(market.no_token_id, 10) + '</div>'
         + '<div class="small muted">撮合状态：' + (matcher.mode || "-") + ' · 最近 ' + (matcher.updatedAt || "-") + '</div>'
         + '<div class="small muted">链上同步：' + (chainSync.running ? "运行中" : "未运行") + ' · 最近 ' + (chainSync.updatedAt || "-") + '</div>';
+      marketInfo.innerHTML += '<div class="small muted">资金巡检：'
+        + (risk.lastFinishedAt || "尚未完成")
+        + ' · covered=' + (riskResult.covered || 0)
+        + ' · overcommitted=' + (riskResult.overcommitted || 0)
+        + ' · failed=' + (riskResult.checkFailed || 0)
+        + '</div>';
 
       bidsBody.innerHTML = book.bids?.length ? book.bids.map((item) =>
         '<tr><td>' + item.price_micros + '</td><td class="right">' + item.total_size + '</td><td class="right">' + item.order_count + '</td></tr>'
@@ -1604,6 +1704,9 @@ function tradePage() {
     });
     document.querySelector("#refresh-wallet-assets").addEventListener("click", () => {
       runAction("读取钱包余额/授权", refreshBrowserWalletAssets);
+    });
+    document.querySelector("#refresh-risk").addEventListener("click", () => {
+      runAction("执行资金风险巡检", () => postJson("/api/risk/refresh"));
     });
     document.querySelector("#sign-submit-order").addEventListener("click", () => {
       runAction("MetaMask EIP-712 签名并提交", signAndSubmitBrowserOrder);
@@ -2034,6 +2137,13 @@ function databaseHealth() {
 function readiness() {
   const database = databaseHealth();
   const chainSync = readChainSyncStatus();
+  const activeReservations = one(
+    `SELECT COUNT(*) AS count FROM order_reservations
+     WHERE status = 'ACTIVE'`,
+  ).count;
+  const riskRequired =
+    enforceBalanceReservations && Number(activeReservations) > 0;
+  const riskResult = riskAuditState.lastResult;
   const checks = {
     database,
     exchange: {
@@ -2053,6 +2163,19 @@ function readiness() {
       processAlive: chainSync.processAlive,
       stale: chainSync.stale,
       updatedAt: chainSync.updatedAt,
+    },
+    riskAudit: {
+      required: riskRequired,
+      ok:
+        !riskRequired ||
+        (Boolean(riskResult) &&
+          Number(riskResult.checkFailed ?? 0) === 0 &&
+          !riskAuditState.lastError),
+      running: riskAuditState.running,
+      lastFinishedAt: riskAuditState.lastFinishedAt,
+      covered: Number(riskResult?.covered ?? 0),
+      overcommitted: Number(riskResult?.overcommitted ?? 0),
+      checkFailed: Number(riskResult?.checkFailed ?? 0),
     },
   };
   return {
@@ -2093,6 +2216,7 @@ function serviceMetrics() {
       chainEvents: one("SELECT COUNT(*) AS count FROM chain_events").count,
       orderStats: orderStats(db),
     },
+    riskAudit: riskAuditState,
     matcher: readMatcherStatus(),
     chainSync: readChainSyncStatus(),
   };
@@ -2155,6 +2279,10 @@ const routes = {
     );
   },
   "/api/orders/stats": () => orderStats(db),
+  "/api/risk/status": () => ({
+    ...riskAuditState,
+    reservations: reservationSummary(db),
+  }),
   "/api/reservations": (url) => {
     const walletAddress = url.searchParams.get("wallet");
     try {
@@ -2299,6 +2427,7 @@ function realtimeSnapshot(marketId) {
           { marketId: selectedMarketId },
         )
       : [],
+    riskAudit: riskAuditState,
   };
 }
 
@@ -2419,6 +2548,13 @@ const server = http.createServer(async (req, res) => {
       }
       if (url.pathname === "/api/sync") {
         return respondAction(200, "DATABASE_SYNC", await syncDatabaseFromChain());
+      }
+      if (url.pathname === "/api/risk/refresh") {
+        return respondAction(
+          200,
+          "RISK_AUDIT_REFRESH",
+          await runRiskAudit("api"),
+        );
       }
       if (url.pathname === "/api/orders") {
         requestBody = await readJsonBody(req);
@@ -2668,11 +2804,25 @@ const orderExpirySweep = setInterval(() => {
 orderExpirySweep.unref();
 expireOrders(db);
 
+const riskAuditSweep = setInterval(() => {
+  runRiskAudit("interval")
+    .then(() => broadcastRealtime("risk-audit"))
+    .catch((error) => {
+      console.error("[api] 资金风险巡检失败：", error);
+    });
+}, riskAuditIntervalMs);
+riskAuditSweep.unref();
+
 server.listen(port, host, () => {
   console.log(
     `Polymarket ${exchangeRuntime.mode} API 已启动：http://${host}:${port}`,
   );
   console.log(`数据库：${dbPath}`);
+  runRiskAudit("startup")
+    .then(() => broadcastRealtime("risk-audit"))
+    .catch((error) => {
+      console.error("[api] 启动资金风险巡检失败：", error);
+    });
 });
 
 let shuttingDown = false;
@@ -2683,6 +2833,7 @@ function shutdown() {
   clearInterval(websocketHeartbeat);
   clearInterval(rateLimitCleanup);
   clearInterval(orderExpirySweep);
+  clearInterval(riskAuditSweep);
   for (const socket of websocketServer.clients) socket.close(1001, "server shutdown");
   websocketServer.close();
   const forceExit = setTimeout(() => {
@@ -2690,8 +2841,15 @@ function shutdown() {
     process.exit(1);
   }, 5_000);
   forceExit.unref();
-  server.close(() => {
+  server.close(async () => {
     clearTimeout(forceExit);
+    if (riskAuditPromise) {
+      try {
+        await riskAuditPromise;
+      } catch {
+        // The audit failure is already reflected in riskAuditState.
+      }
+    }
     db.close();
     process.exit(0);
   });

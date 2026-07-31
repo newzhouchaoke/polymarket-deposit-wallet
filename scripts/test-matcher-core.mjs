@@ -7,6 +7,7 @@ import {
   collateralForOutcome,
   feeForCashValue,
 } from "./matcher-core.mjs";
+import { syncAllReservations } from "./order-risk.mjs";
 
 const db = new DatabaseSync(":memory:");
 initSchema(db);
@@ -51,7 +52,7 @@ db.prepare(
    WHERE local_order_id = 'invalid-buy'`,
 ).run();
 
-const match = bestMatch(db, 5);
+const match = bestMatch(db, 5, { enforceRisk: false });
 assert.equal(match.buy.local_order_id, "buy");
 assert.deepEqual(
   match.makers.map(({ sell }) => sell.local_order_id),
@@ -70,9 +71,33 @@ assert.equal(feeForCashValue(1_096_000n, 50), 5_480n);
 assert.equal(feeForCashValue(250_000n, 0), 0n);
 assert.throws(() => feeForCashValue(1_000n, 10_000), /0-9999/);
 
-const pair = bestPair(db);
+const pair = bestPair(db, { enforceRisk: false });
 assert.equal(pair.buy.local_order_id, "buy");
 assert.equal(pair.sell.local_order_id, "sell-a");
 
+assert.match(
+  bestMatch(db, 5, { enforceRisk: true }).reason,
+  /没有可撮合/,
+);
+syncAllReservations(db);
+db.prepare(
+  `UPDATE order_reservations
+   SET risk_status = 'COVERED'
+   WHERE status = 'ACTIVE'`,
+).run();
+assert.equal(
+  bestMatch(db, 5, { enforceRisk: true }).buy.local_order_id,
+  "buy",
+);
+db.prepare(
+  `UPDATE order_reservations
+   SET risk_status = 'OVERCOMMITTED'
+   WHERE local_order_id = 'buy'`,
+).run();
+assert.match(
+  bestMatch(db, 5, { enforceRisk: true }).reason,
+  /没有可撮合/,
+);
+
 db.close();
-console.log("matcher-core multi-maker tests passed");
+console.log("matcher-core multi-maker and risk filter tests passed");

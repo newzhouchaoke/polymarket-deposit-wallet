@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { initSchema } from "./db.js";
 import {
+  auditActiveReservations,
   assertReservationCapacity,
   readChainCapacity,
   reservationSpec,
@@ -115,5 +116,56 @@ const sellCapacity = await readChainCapacity(
 assert.equal(sellCapacity.capacity, 0n);
 assert.equal(sellCapacity.approvedForAll, false);
 
+insert.run({
+  id: "buy-2",
+  maker,
+  side: "BUY",
+  tokenId: "1",
+  makerAmount: "600",
+  takerAmount: "1000",
+});
+insert.run({
+  id: "buy-3",
+  maker,
+  side: "BUY",
+  tokenId: "1",
+  makerAmount: "500",
+  takerAmount: "1000",
+});
+const audit = await auditActiveReservations(db, runtime, {
+  readContract: async ({ functionName }) =>
+    functionName === "balanceOf" ? 1000n : 1000n,
+});
+assert.equal(audit.groups, 1);
+assert.equal(audit.covered, 1);
+assert.equal(audit.overcommitted, 1);
+assert.equal(
+  db.prepare(
+    `SELECT risk_status FROM order_reservations
+     WHERE local_order_id = 'buy-2'`,
+  ).get().risk_status,
+  "COVERED",
+);
+assert.equal(
+  db.prepare(
+    `SELECT risk_status FROM order_reservations
+     WHERE local_order_id = 'buy-3'`,
+  ).get().risk_status,
+  "OVERCOMMITTED",
+);
+const failedAudit = await auditActiveReservations(db, runtime, {
+  readContract: async () => {
+    throw new Error("rpc unavailable");
+  },
+});
+assert.equal(failedAudit.checkFailed, 2);
+assert.equal(
+  db.prepare(
+    `SELECT COUNT(*) AS count FROM order_reservations
+     WHERE risk_status = 'CHECK_FAILED'`,
+  ).get().count,
+  2,
+);
+
 db.close();
-console.log("order reservation and chain capacity tests passed");
+console.log("order reservation, live audit, and chain capacity tests passed");

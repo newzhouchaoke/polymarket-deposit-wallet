@@ -187,6 +187,14 @@ export function initSchema(db) {
       reserved_amount TEXT NOT NULL,
       status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'RELEASED')),
       release_reason TEXT,
+      risk_status TEXT NOT NULL DEFAULT 'UNCHECKED',
+      chain_capacity TEXT,
+      chain_balance TEXT,
+      chain_allowance TEXT,
+      approved_for_all INTEGER,
+      risk_error TEXT,
+      last_checked_at TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (chain_id, local_order_id),
       FOREIGN KEY (chain_id, local_order_id)
@@ -346,6 +354,35 @@ export function initSchema(db) {
       WHERE order_hash IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_order_fills_order_hash
       ON order_fills(chain_id, order_hash);
+  `);
+
+  const reservationColumns = db.prepare(
+    "PRAGMA table_info(order_reservations)",
+  ).all();
+  for (const [name, definition] of [
+    ["risk_status", "TEXT NOT NULL DEFAULT 'UNCHECKED'"],
+    ["chain_capacity", "TEXT"],
+    ["chain_balance", "TEXT"],
+    ["chain_allowance", "TEXT"],
+    ["approved_for_all", "INTEGER"],
+    ["risk_error", "TEXT"],
+    ["last_checked_at", "TEXT"],
+    ["created_at", "TEXT"],
+  ]) {
+    if (!reservationColumns.some((column) => column.name === name)) {
+      db.exec(`ALTER TABLE order_reservations ADD COLUMN ${name} ${definition};`);
+    }
+  }
+  db.exec(`
+    UPDATE order_reservations
+    SET created_at = COALESCE(created_at, updated_at, CURRENT_TIMESTAMP);
+    UPDATE order_reservations
+    SET risk_status = CASE
+      WHEN status = 'RELEASED' THEN 'RELEASED'
+      ELSE COALESCE(NULLIF(risk_status, ''), 'UNCHECKED')
+    END;
+    CREATE INDEX IF NOT EXISTS idx_order_reservations_risk
+      ON order_reservations(chain_id, status, risk_status);
   `);
 }
 

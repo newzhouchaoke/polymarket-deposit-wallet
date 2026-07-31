@@ -18,7 +18,10 @@ import {
   readJsonStatus,
   statusWithLiveness,
 } from "./service-utils.mjs";
-import { syncOrderReservation } from "./order-risk.mjs";
+import {
+  auditActiveReservations,
+  syncOrderReservation,
+} from "./order-risk.mjs";
 
 export const matcherStatusPath = path.join(
   projectDir,
@@ -75,7 +78,28 @@ export function readMatcherStatus() {
   );
 }
 
-export function bestMatch(db, maxMakers = Number(process.env.MATCHER_MAX_MAKERS ?? "5")) {
+export function matcherRiskEnabled() {
+  return String(
+    process.env.MATCHER_ENFORCE_RISK ??
+      (dbMode === "official-v2" ? "true" : "false"),
+  ).toLowerCase() === "true";
+}
+
+export function bestMatch(
+  db,
+  maxMakers = Number(process.env.MATCHER_MAX_MAKERS ?? "5"),
+  options = {},
+) {
+  const enforceRisk = options.enforceRisk ?? matcherRiskEnabled();
+  const riskClause = enforceRisk
+    ? `AND EXISTS (
+         SELECT 1 FROM order_reservations reservation
+         WHERE reservation.chain_id = orders.chain_id
+           AND reservation.local_order_id = orders.local_order_id
+           AND reservation.status = 'ACTIVE'
+           AND reservation.risk_status = 'COVERED'
+       )`
+    : "";
   const buys = db.prepare(
     `SELECT *
      FROM orders
@@ -86,6 +110,7 @@ export function bestMatch(db, maxMakers = Number(process.env.MATCHER_MAX_MAKERS 
        AND (expiration = 0 OR expiration > CAST(strftime('%s','now') AS INTEGER))
        AND CAST(filled_maker_amount AS INTEGER) < CAST(maker_amount AS INTEGER)
        AND CAST(filled_taker_amount AS INTEGER) < CAST(taker_amount AS INTEGER)
+       ${riskClause}
      ORDER BY price_micros DESC, updated_at ASC`,
   ).all();
 
@@ -104,6 +129,7 @@ export function bestMatch(db, maxMakers = Number(process.env.MATCHER_MAX_MAKERS 
        AND market_id = :marketId
        AND token_id = :tokenId
        AND price_micros <= :buyPriceMicros
+       ${riskClause}
      ORDER BY price_micros ASC, updated_at ASC
      LIMIT :limit`,
   );
@@ -154,8 +180,8 @@ export function bestMatch(db, maxMakers = Number(process.env.MATCHER_MAX_MAKERS 
   };
 }
 
-export function bestPair(db) {
-  const match = bestMatch(db, 1);
+export function bestPair(db, options = {}) {
+  const match = bestMatch(db, 1, options);
   if (match.reason) return match;
   return { buy: match.buy, sell: match.makers[0].sell };
 }
@@ -231,12 +257,17 @@ export async function matchOnce(options = {}) {
   }
   const db = openResearchDb();
   try {
-    const match = bestMatch(db);
+    const enforceRisk = matcherRiskEnabled();
+    const riskAudit = enforceRisk
+      ? await auditActiveReservations(db, deployment)
+      : null;
+    const match = bestMatch(db, undefined, { enforceRisk });
     if (match.reason) {
       return {
         matched: false,
         reason: match.reason,
         bestBuy: match.bestBuy?.local_order_id,
+        riskAudit,
       };
     }
 
@@ -263,6 +294,7 @@ export async function matchOnce(options = {}) {
       outcomeAmount: outcomeAmount.toString(),
       collateralAmount: collateralAmount.toString(),
       feeRateBps,
+      riskAudit,
       takerFeeAmount: takerFeeAmount.toString(),
       makerFeeAmounts: makerFeeAmounts.map((fee) => fee.toString()),
       makerFills: match.makers.map(({ sell, outcomeAmount: outcome, collateralAmount: collateral }) => ({
