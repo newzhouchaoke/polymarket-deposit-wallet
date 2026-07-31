@@ -16,6 +16,92 @@ export const ORDER_TYPES = [
   { name: "builder", type: "bytes32" },
 ];
 
+function inferredProviderInfo(provider, index) {
+  const phantom = provider?.isPhantom === true;
+  const metamask = provider?.isMetaMask === true && !phantom;
+  return {
+    uuid: `legacy-${index}`,
+    name: metamask ? "MetaMask" : phantom ? "Phantom" : `Injected Wallet ${index + 1}`,
+    rdns: metamask ? "io.metamask" : phantom ? "app.phantom" : "unknown.injected",
+    icon: "",
+  };
+}
+
+function addProviderCandidate(candidates, provider, info) {
+  if (!provider?.request) return;
+  const existing = candidates.find((candidate) => candidate.provider === provider);
+  if (existing) {
+    if (info?.rdns === "io.metamask") existing.info = info;
+    return;
+  }
+  candidates.push({
+    provider,
+    info: info ?? inferredProviderInfo(provider, candidates.length),
+  });
+}
+
+export async function discoverInjectedProviders(
+  browserWindow = globalThis,
+  waitMs = 120,
+) {
+  const candidates = [];
+  const announced = (event) => {
+    addProviderCandidate(
+      candidates,
+      event?.detail?.provider,
+      event?.detail?.info,
+    );
+  };
+  if (browserWindow?.addEventListener && browserWindow?.dispatchEvent) {
+    browserWindow.addEventListener("eip6963:announceProvider", announced);
+    try {
+      const EventConstructor = browserWindow.Event ?? globalThis.Event;
+      browserWindow.dispatchEvent(new EventConstructor("eip6963:requestProvider"));
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    } finally {
+      browserWindow.removeEventListener?.("eip6963:announceProvider", announced);
+    }
+  }
+  const injected = browserWindow?.ethereum;
+  const legacyProviders = Array.isArray(injected?.providers)
+    ? injected.providers
+    : injected
+      ? [injected]
+      : [];
+  for (const provider of legacyProviders) {
+    addProviderCandidate(
+      candidates,
+      provider,
+      inferredProviderInfo(provider, candidates.length),
+    );
+  }
+  return candidates;
+}
+
+export function isMetaMaskCandidate(candidate) {
+  const rdns = String(candidate?.info?.rdns ?? "").toLowerCase();
+  return (
+    rdns === "io.metamask" ||
+    (candidate?.provider?.isMetaMask === true &&
+      candidate?.provider?.isPhantom !== true &&
+      !rdns.includes("phantom"))
+  );
+}
+
+export async function findMetaMaskProvider(browserWindow = globalThis) {
+  const candidates = await discoverInjectedProviders(browserWindow);
+  const metamask = candidates.find(isMetaMaskCandidate);
+  if (!metamask) {
+    const discovered = candidates
+      .map((candidate) => candidate.info?.name ?? candidate.info?.rdns ?? "unknown")
+      .join(", ");
+    throw new Error(
+      `未发现 MetaMask Provider。已发现：${discovered || "无"}。请安装/启用 MetaMask，刷新页面后重试。`,
+    );
+  }
+  return metamask;
+}
+
 function requireProvider(provider) {
   if (!provider?.request) {
     throw new Error("未检测到 MetaMask/EIP-1193 钱包，请先安装并解锁钱包扩展");

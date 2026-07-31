@@ -435,6 +435,11 @@ curl http://127.0.0.1:8787/api/orders/stats
 发授权交易。Safe(2) 和 ERC-1271(3) 需要各自的包装/多签流程，页面保留手动签名方式，
 不会把普通 MetaMask 签名错误标记成这两种类型。
 
+如果 Chrome 同时安装 Phantom 和 MetaMask，页面通过 EIP-6963 与
+`window.ethereum.providers` 查找 `io.metamask`，明确绑定 MetaMask，不直接使用可能被
+Phantom 占用的 `window.ethereum`。首次添加 Amoy 后会再次执行切换，并以数值方式确认
+chainId 确实为 `80002`。
+
 ```bash
 npm run test:frontend
 ```

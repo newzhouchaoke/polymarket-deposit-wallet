@@ -3,7 +3,9 @@ import {
   AMOY_CHAIN_HEX,
   buildOrderForWallet,
   connectWallet,
+  discoverInjectedProviders,
   ensureAmoy,
+  findMetaMaskProvider,
   isAmoyChainId,
   normalizeChainId,
   readWalletAssets,
@@ -16,6 +18,52 @@ assert.equal(normalizeChainId("80002"), 80002);
 assert.equal(normalizeChainId(80002), 80002);
 assert.equal(normalizeChainId("not-a-chain"), null);
 assert.equal(isAmoyChainId("0X13882"), true);
+
+const phantomProvider = {
+  isPhantom: true,
+  isMetaMask: true,
+  async request() {},
+};
+const metaMaskProvider = {
+  isMetaMask: true,
+  async request() {},
+};
+const multiWallet = {
+  ethereum: {
+    isPhantom: true,
+    providers: [phantomProvider, metaMaskProvider],
+  },
+};
+const discoveredLegacy = await discoverInjectedProviders(multiWallet, 0);
+assert.equal(discoveredLegacy.length, 2);
+assert.equal((await findMetaMaskProvider(multiWallet)).provider, metaMaskProvider);
+
+const eip6963Window = new EventTarget();
+eip6963Window.Event = Event;
+eip6963Window.ethereum = phantomProvider;
+eip6963Window.addEventListener("eip6963:requestProvider", () => {
+  const announcement = new Event("eip6963:announceProvider");
+  Object.defineProperty(announcement, "detail", {
+    value: {
+      info: {
+        uuid: "metamask-test",
+        name: "MetaMask",
+        rdns: "io.metamask",
+        icon: "",
+      },
+      provider: metaMaskProvider,
+    },
+  });
+  eip6963Window.dispatchEvent(announcement);
+});
+assert.equal(
+  (await findMetaMaskProvider(eip6963Window)).provider,
+  metaMaskProvider,
+);
+await assert.rejects(
+  findMetaMaskProvider({ ethereum: phantomProvider }),
+  /未发现 MetaMask Provider/,
+);
 
 const account = "0x0000000000000000000000000000000000000002";
 const proxy = "0x0000000000000000000000000000000000000003";

@@ -1011,7 +1011,7 @@ function tradePage() {
 
       <div class="card">
         <h2>MetaMask / 浏览器钱包</h2>
-        <p class="muted small">连接后自动切换 Polygon Amoy。浏览器 EIP-712 签名支持 EOA(0) 和官方 Proxy(1)，不会发送链上交易。</p>
+        <p class="muted small">页面会通过 EIP-6963 明确选择 MetaMask，不使用 Phantom 注入的默认 Provider；连接后自动切换 Polygon Amoy。浏览器签名支持 EOA(0) 和官方 Proxy(1)。</p>
         <button id="connect-wallet" type="button">连接 MetaMask</button>
         <button id="refresh-wallet-assets" type="button" class="secondary">刷新余额/授权</button>
         <div id="wallet-status" class="status">尚未连接钱包</div>
@@ -1175,6 +1175,7 @@ function tradePage() {
       AMOY_CHAIN_HEX,
       buildOrderForWallet,
       connectWallet as connectBrowserWallet,
+      findMetaMaskProvider,
       isAmoyChainId,
       normalizeChainId,
       readWalletAssets,
@@ -1201,6 +1202,8 @@ function tradePage() {
     const walletStatus = document.querySelector("#wallet-status");
     const walletAssets = document.querySelector("#wallet-assets");
     let connectedAccount = null;
+    let activeWalletProvider = null;
+    let activeWalletInfo = null;
 
     function shortText(value, size = 8) {
       const text = String(value || "");
@@ -1278,7 +1281,8 @@ function tradePage() {
       connectedAccount = account || null;
       walletStatus.className = "status";
       walletStatus.textContent = connectedAccount
-        ? "已连接 Amoy：" + connectedAccount
+        ? "已连接 " + (activeWalletInfo?.name || "MetaMask") +
+          " · Polygon Amoy (80002) · " + connectedAccount
         : "尚未连接钱包";
       if (!connectedAccount) return;
       form.elements.signer.value = connectedAccount;
@@ -1290,9 +1294,10 @@ function tradePage() {
 
     async function refreshBrowserWalletAssets() {
       if (!connectedAccount) throw new Error("请先连接 MetaMask");
+      if (!activeWalletProvider) throw new Error("MetaMask Provider 尚未选择");
       const maker = form.elements.maker.value.trim();
       const snapshot = await readWalletAssets(
-        window.ethereum,
+        activeWalletProvider,
         runtime,
         maker,
         connectedAccount,
@@ -1308,8 +1313,49 @@ function tradePage() {
       return snapshot;
     }
 
+    function handleWalletAccountsChanged(accounts) {
+      updateConnectedAccount(accounts?.[0] || null);
+      if (connectedAccount) {
+        refreshBrowserWalletAssets().catch((error) => {
+          walletAssets.textContent = String(error);
+        });
+      }
+    }
+
+    function handleWalletChainChanged(chainId) {
+      const onAmoy = isAmoyChainId(chainId);
+      const numericChainId = normalizeChainId(chainId);
+      walletStatus.className = onAmoy ? "status" : "status error";
+      walletStatus.textContent =
+        (activeWalletInfo?.name || "MetaMask") + " · " +
+        (connectedAccount ? connectedAccount + " · " : "") +
+        (onAmoy
+          ? "Polygon Amoy · chainId 80002"
+          : "当前 chainId " + (numericChainId ?? chainId) +
+            "，请点击“连接 MetaMask”切换到 Polygon Amoy (80002)");
+      form.elements.signature.value = "";
+    }
+
+    function bindWalletProvider(candidate) {
+      if (activeWalletProvider === candidate.provider) return;
+      activeWalletProvider?.removeListener?.(
+        "accountsChanged",
+        handleWalletAccountsChanged,
+      );
+      activeWalletProvider?.removeListener?.(
+        "chainChanged",
+        handleWalletChainChanged,
+      );
+      activeWalletProvider = candidate.provider;
+      activeWalletInfo = candidate.info;
+      activeWalletProvider.on?.("accountsChanged", handleWalletAccountsChanged);
+      activeWalletProvider.on?.("chainChanged", handleWalletChainChanged);
+    }
+
     async function connectAndRefreshWallet() {
-      const account = await connectBrowserWallet(window.ethereum);
+      const candidate = await findMetaMaskProvider(window);
+      bindWalletProvider(candidate);
+      const account = await connectBrowserWallet(activeWalletProvider);
       updateConnectedAccount(account);
       await refreshBrowserWalletAssets();
       return {
@@ -1330,7 +1376,7 @@ function tradePage() {
         connectedAccount,
       );
       const signature = await signOrderTypedData(
-        window.ethereum,
+        activeWalletProvider,
         connectedAccount,
         typedData,
       );
@@ -1437,29 +1483,6 @@ function tradePage() {
           form.elements.side.value === "SELL" ? sellerWallet : buyerWallet;
       }
     });
-    if (window.ethereum?.on) {
-      window.ethereum.on("accountsChanged", (accounts) => {
-        updateConnectedAccount(accounts?.[0] || null);
-        if (connectedAccount) {
-          refreshBrowserWalletAssets().catch((error) => {
-            walletAssets.textContent = String(error);
-          });
-        }
-      });
-      window.ethereum.on("chainChanged", (chainId) => {
-        const onAmoy = isAmoyChainId(chainId);
-        const numericChainId = normalizeChainId(chainId);
-        walletStatus.className = onAmoy ? "status" : "status error";
-        walletStatus.textContent =
-          (connectedAccount ? connectedAccount + " · " : "") +
-          (onAmoy
-            ? "Polygon Amoy · chainId 80002"
-            : "当前 chainId " + (numericChainId ?? chainId) +
-              "，请重新连接并切换到 Polygon Amoy (80002)");
-        form.elements.signature.value = "";
-      });
-    }
-
     document.querySelector("#seed-signed").addEventListener("click", () => {
       runAction("生成签名订单", () => postJson("/api/orders/seed-signed"));
     });
