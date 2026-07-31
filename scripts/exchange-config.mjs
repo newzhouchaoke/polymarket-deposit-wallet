@@ -175,6 +175,8 @@ function officialMarket() {
     winningOutcome: Number(fileMarket.winningOutcome ?? 0),
     prepared: Boolean(fileMarket.prepared),
     prepareTx: fileMarket.prepareTx ?? null,
+    approveTx: fileMarket.approveTx ?? null,
+    splitTx: fileMarket.splitTx ?? null,
     closeTx: fileMarket.closeTx ?? null,
     resolveTx: fileMarket.resolveTx ?? null,
     payoutDenominator: String(fileMarket.payoutDenominator ?? "0"),

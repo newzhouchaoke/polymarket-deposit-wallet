@@ -163,26 +163,184 @@ function bigintJson(value) {
   );
 }
 
+function relevantOfficialCtfEvent(eventName, args) {
+  if (deployment.mode !== OFFICIAL_MODE) return true;
+  const market = deployment.market;
+  if (!market) return false;
+  const conditionId = String(args.conditionId ?? "").toLowerCase();
+  if (conditionId) {
+    return conditionId === String(market.conditionId).toLowerCase();
+  }
+  const tokenIds = new Set([
+    String(market.yesTokenId),
+    String(market.noTokenId),
+  ]);
+  if (args.id !== undefined) return tokenIds.has(String(args.id));
+  if (Array.isArray(args.ids)) {
+    return args.ids.some((id) => tokenIds.has(String(id)));
+  }
+  if (eventName === "ApprovalForAll") {
+    const configuredWallets = [
+      deployment.buyerWallet,
+      deployment.sellerWallet,
+    ]
+      .filter(Boolean)
+      .map((address) => address.toLowerCase());
+    return configuredWallets.includes(String(args.account ?? "").toLowerCase());
+  }
+  return false;
+}
+
+function cleanupIrrelevantCtfEvents() {
+  if (deployment.mode !== OFFICIAL_MODE) return;
+  const events = db
+    .prepare(
+      `SELECT tx_hash, log_index, event_name, args_json
+       FROM chain_events
+       WHERE chain_id = ? AND lower(contract_address) = lower(?)`,
+    )
+    .all(chainId, deployment.ctf);
+  const remove = db.prepare(
+    `DELETE FROM chain_events
+     WHERE chain_id = ? AND tx_hash = ? AND log_index = ?`,
+  );
+  for (const event of events) {
+    try {
+      const args = JSON.parse(event.args_json);
+      if (!relevantOfficialCtfEvent(event.event_name, args)) {
+        remove.run(chainId, event.tx_hash, event.log_index);
+      }
+    } catch {
+      remove.run(chainId, event.tx_hash, event.log_index);
+    }
+  }
+}
+
 function getSyncState() {
   return db
-    .prepare("SELECT last_block FROM sync_state WHERE chain_id = ? AND name = ?")
+    .prepare(
+      "SELECT last_block, last_block_hash FROM sync_state WHERE chain_id = ? AND name = ?",
+    )
     .get(chainId, deployment.syncStateName);
 }
 
-function setSyncState(lastBlock) {
+function setSyncState(lastBlock, lastBlockHash = null) {
   upsert(
     db,
-    `INSERT INTO sync_state(chain_id, name, last_block, updated_at)
-     VALUES(:chainId, :name, :lastBlock, CURRENT_TIMESTAMP)
+    `INSERT INTO sync_state(
+       chain_id, name, last_block, last_block_hash, updated_at
+     )
+     VALUES(:chainId, :name, :lastBlock, :lastBlockHash, CURRENT_TIMESTAMP)
      ON CONFLICT(chain_id, name) DO UPDATE SET
        last_block=excluded.last_block,
+       last_block_hash=excluded.last_block_hash,
        updated_at=excluded.updated_at`,
     {
       chainId,
       name: deployment.syncStateName,
       lastBlock: Number(lastBlock),
+      lastBlockHash,
     },
   );
+}
+
+function rememberBlock(block) {
+  upsert(
+    db,
+    `INSERT INTO chain_blocks(
+       chain_id, block_number, block_hash, parent_hash, processed_at
+     ) VALUES(
+       :chainId, :blockNumber, :blockHash, :parentHash, CURRENT_TIMESTAMP
+     )
+     ON CONFLICT(chain_id, block_number) DO UPDATE SET
+       block_hash=excluded.block_hash,
+       parent_hash=excluded.parent_hash,
+       processed_at=excluded.processed_at`,
+    {
+      chainId,
+      blockNumber: Number(block.number),
+      blockHash: block.hash,
+      parentHash: block.parentHash,
+    },
+  );
+}
+
+async function rollbackIfReorg(state) {
+  if (!state?.last_block_hash) return state;
+  const blockNumber = BigInt(state.last_block);
+  const current = await publicClient.getBlock({ blockNumber });
+  if (
+    current.hash &&
+    current.hash.toLowerCase() === state.last_block_hash.toLowerCase()
+  ) {
+    return state;
+  }
+
+  const candidates = db
+    .prepare(
+      `SELECT block_number, block_hash
+       FROM chain_blocks
+       WHERE chain_id = ? AND block_number < ?
+       ORDER BY block_number DESC LIMIT 128`,
+    )
+    .all(chainId, Number(blockNumber));
+  let commonBlock = 0;
+  let commonHash = null;
+  for (const candidate of candidates) {
+    const canonical = await publicClient.getBlock({
+      blockNumber: BigInt(candidate.block_number),
+    });
+    if (
+      canonical.hash &&
+      canonical.hash.toLowerCase() === candidate.block_hash.toLowerCase()
+    ) {
+      commonBlock = candidate.block_number;
+      commonHash = canonical.hash;
+      break;
+    }
+  }
+
+  const removedTransactions = db
+    .prepare(
+      `SELECT DISTINCT tx_hash FROM chain_events
+       WHERE chain_id = ? AND block_number > ?`,
+    )
+    .all(chainId, commonBlock)
+    .map((row) => row.tx_hash);
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare(
+      "DELETE FROM chain_events WHERE chain_id = ? AND block_number > ?",
+    ).run(chainId, commonBlock);
+    db.prepare(
+      "DELETE FROM order_fills WHERE chain_id = ? AND block_number > ?",
+    ).run(chainId, commonBlock);
+    db.prepare(
+      "DELETE FROM chain_blocks WHERE chain_id = ? AND block_number > ?",
+    ).run(chainId, commonBlock);
+    for (const hash of removedTransactions) {
+      db.prepare("DELETE FROM trades WHERE chain_id = ? AND tx_hash = ?").run(
+        chainId,
+        hash,
+      );
+      db.prepare(
+        "DELETE FROM chain_actions WHERE chain_id = ? AND tx_hash = ?",
+      ).run(chainId, hash);
+    }
+    setSyncState(commonBlock, commonHash);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+  await reconcileOrdersFromFills();
+  console.warn(
+    `检测到链重组：已从 block=${state.last_block} 回滚到共同区块 ${commonBlock}`,
+  );
+  return {
+    last_block: commonBlock,
+    last_block_hash: commonHash,
+  };
 }
 
 async function initialFromBlock() {
@@ -446,11 +604,11 @@ function saveOrderFill(event, log) {
     `INSERT INTO order_fills(
        chain_id, tx_hash, log_index, order_hash, local_order_id, maker, taker,
        side, token_id, maker_amount_filled, taker_amount_filled, fee,
-       block_number, raw_json
+       block_number, block_hash, raw_json
      ) VALUES(
        :chainId, :txHash, :logIndex, :orderHash, :localOrderId, :maker, :taker,
        :side, :tokenId, :makerAmountFilled, :takerAmountFilled, :fee,
-       :blockNumber, :rawJson
+       :blockNumber, :blockHash, :rawJson
      )
      ON CONFLICT(chain_id, tx_hash, log_index) DO UPDATE SET
        order_hash=excluded.order_hash,
@@ -463,6 +621,7 @@ function saveOrderFill(event, log) {
        taker_amount_filled=excluded.taker_amount_filled,
        fee=excluded.fee,
        block_number=excluded.block_number,
+       block_hash=excluded.block_hash,
        raw_json=excluded.raw_json`,
     {
       chainId,
@@ -478,6 +637,7 @@ function saveOrderFill(event, log) {
       takerAmountFilled: args.takerAmountFilled.toString(),
       fee: args.fee.toString(),
       blockNumber: Number(log.blockNumber),
+      blockHash: log.blockHash ?? null,
       rawJson: bigintJson(args),
     },
   );
@@ -602,16 +762,20 @@ async function reconcileOrdersFromFills() {
         }`,
       );
     }
-    if (filledMaker === 0n && filledTaker === 0n && !chainFilled) continue;
     let status =
       chainFilled ||
       filledMaker >= BigInt(order.maker_amount) ||
       filledTaker >= BigInt(order.taker_amount)
         ? "FILLED"
-        : "PARTIALLY_FILLED";
+        : filledMaker > 0n || filledTaker > 0n
+          ? "PARTIALLY_FILLED"
+          : "OPEN";
     if (order.status === "CANCELLED" && status !== "FILLED") status = "CANCELLED";
     if (order.status === "USER_PAUSED" && status !== "FILLED") {
       status = "USER_PAUSED";
+    }
+    if (["EXPIRED", "FAILED"].includes(order.status) && status !== "FILLED") {
+      status = order.status;
     }
     update.run({
       chainId,
@@ -627,6 +791,13 @@ async function reconcileOrdersFromFills() {
 function saveEvent(log, decoded, config) {
   if (
     deployment.mode === OFFICIAL_MODE &&
+    config.address.toLowerCase() === deployment.ctf.toLowerCase() &&
+    !relevantOfficialCtfEvent(decoded.eventName, decoded.args)
+  ) {
+    return;
+  }
+  if (
+    deployment.mode === OFFICIAL_MODE &&
     ["ConditionResolution", "PayoutRedemption"].includes(decoded.eventName) &&
     String(decoded.args.conditionId).toLowerCase() !==
       String(deployment.market?.conditionId ?? "").toLowerCase()
@@ -636,13 +807,15 @@ function saveEvent(log, decoded, config) {
   upsert(
     db,
     `INSERT INTO chain_events(
-       chain_id, tx_hash, block_number, log_index, event_name, contract_address, args_json
+       chain_id, tx_hash, block_number, block_hash, log_index,
+       event_name, contract_address, args_json
      )
      VALUES(
-       :chainId, :txHash, :blockNumber, :logIndex, :eventName, :contractAddress, :argsJson
+       :chainId, :txHash, :blockNumber, :blockHash, :logIndex, :eventName, :contractAddress, :argsJson
      )
      ON CONFLICT(chain_id, tx_hash, log_index) DO UPDATE SET
        block_number=excluded.block_number,
+       block_hash=excluded.block_hash,
        event_name=excluded.event_name,
        contract_address=excluded.contract_address,
        args_json=excluded.args_json`,
@@ -650,6 +823,7 @@ function saveEvent(log, decoded, config) {
       chainId,
       txHash: log.transactionHash,
       blockNumber: Number(log.blockNumber),
+      blockHash: log.blockHash ?? null,
       logIndex: Number(log.logIndex),
       eventName: decoded.eventName,
       contractAddress: config.address,
@@ -736,6 +910,12 @@ async function syncKnownTransactions() {
   const deploymentTxHashes = Object.values(deployment.txs ?? {}).filter(
     (hash) => typeof hash === "string" && hash.startsWith("0x"),
   );
+  const marketTxHashes = [
+    deployment.market?.prepareTx,
+    deployment.market?.splitTx,
+    deployment.market?.approveTx,
+    deployment.market?.resolveTx,
+  ].filter((hash) => typeof hash === "string" && hash.startsWith("0x"));
   const tradeTxHashes = db
     .prepare("SELECT tx_hash FROM trades WHERE chain_id = ? AND tx_hash LIKE '0x%'")
     .all(chainId)
@@ -744,16 +924,16 @@ async function syncKnownTransactions() {
     .prepare("SELECT tx_hash FROM chain_actions WHERE chain_id = ? AND tx_hash LIKE '0x%'")
     .all(chainId)
     .map((row) => row.tx_hash);
-  const txHashes = [...new Set([...deploymentTxHashes, ...tradeTxHashes, ...actionTxHashes])];
+  const txHashes = [
+    ...new Set([
+      ...deploymentTxHashes,
+      ...marketTxHashes,
+      ...tradeTxHashes,
+      ...actionTxHashes,
+    ]),
+  ];
   let decodedCount = 0;
 
-  const selectedAddresses = addressConfigs.map((config) => config.address.toLowerCase());
-  const placeholders = selectedAddresses.map(() => "?").join(", ");
-  db.prepare(
-    `DELETE FROM chain_events
-     WHERE chain_id = ?
-       AND lower(contract_address) IN (${placeholders})`,
-  ).run(chainId, ...selectedAddresses);
   for (const txHash of txHashes) {
     const receipt = await publicClient.getTransactionReceipt({ hash: txHash });
     for (const log of receipt.logs) {
@@ -774,41 +954,58 @@ async function syncKnownTransactions() {
     }
   }
 
-  const latestBlock = await publicClient.getBlockNumber();
   await reconcileOrdersFromFills();
-  setSyncState(latestBlock);
   console.log(`已同步已知交易 ${txHashes.length} 笔，解析事件 ${decodedCount} 条`);
-  console.log(`sync_state 已更新到 latestBlock=${latestBlock}`);
+  console.log("已知交易同步不会推进 FULL_SYNC 的确认区块游标");
   console.log(`数据库：${dbPath}`);
 }
 
 if (process.env.FULL_SYNC !== "true") {
   await syncKnownTransactions();
+  cleanupIrrelevantCtfEvents();
   db.close();
   process.exit(0);
 }
 
 ensureOrderHashes();
 
-const state = getSyncState();
+let state = await rollbackIfReorg(getSyncState());
 const chainLatestBlock = await publicClient.getBlockNumber();
+const confirmations = BigInt(process.env.SYNC_CONFIRMATIONS ?? "5");
+if (confirmations < 0n || confirmations > 1_000n) {
+  throw new Error("SYNC_CONFIRMATIONS 必须在 0-1000 之间");
+}
+const chainSafeBlock =
+  chainLatestBlock > confirmations ? chainLatestBlock - confirmations : 0n;
+if (state && !state.last_block_hash) {
+  const cursorBlock = await publicClient.getBlock({
+    blockNumber: BigInt(state.last_block),
+  });
+  rememberBlock(cursorBlock);
+  setSyncState(cursorBlock.number, cursorBlock.hash);
+  state = { ...state, last_block_hash: cursorBlock.hash };
+}
 let fromBlock = state ? BigInt(state.last_block) + 1n : await initialFromBlock();
 let synced = 0;
 let decodedCount = 0;
 const chunkSize = BigInt(process.env.SYNC_CHUNK_SIZE ?? "2000");
 const maxBlocksPerRun = BigInt(process.env.SYNC_MAX_BLOCKS_PER_RUN ?? "0");
 const latestBlock =
-  maxBlocksPerRun > 0n && fromBlock + maxBlocksPerRun - 1n < chainLatestBlock
+  maxBlocksPerRun > 0n && fromBlock + maxBlocksPerRun - 1n < chainSafeBlock
     ? fromBlock + maxBlocksPerRun - 1n
-    : chainLatestBlock;
+    : chainSafeBlock;
 
-if (fromBlock > chainLatestBlock) {
-  console.log(`已是最新：last_block=${state.last_block}, latest=${chainLatestBlock}`);
+if (fromBlock > chainSafeBlock) {
+  console.log(
+    `已是最新确认状态：last_block=${state?.last_block ?? 0}, safe=${chainSafeBlock}, latest=${chainLatestBlock}, confirmations=${confirmations}`,
+  );
   db.close();
   process.exit(0);
 }
 
-console.log(`同步 Amoy 事件：fromBlock=${fromBlock} toBlock=${latestBlock} chainLatest=${chainLatestBlock}`);
+console.log(
+  `同步 Amoy 确认事件：fromBlock=${fromBlock} toBlock=${latestBlock} safe=${chainSafeBlock} chainLatest=${chainLatestBlock} confirmations=${confirmations}`,
+);
 
 while (fromBlock <= latestBlock) {
   const toBlock = fromBlock + chunkSize - 1n > latestBlock
@@ -837,13 +1034,16 @@ while (fromBlock <= latestBlock) {
     }
   }
 
-  setSyncState(toBlock);
+  const canonicalBlock = await publicClient.getBlock({ blockNumber: toBlock });
+  rememberBlock(canonicalBlock);
+  setSyncState(toBlock, canonicalBlock.hash);
   synced += logs.length;
   console.log(`区块 ${fromBlock}-${toBlock}：读取 ${logs.length} 条 logs，已解析 ${decodedCount} 条`);
   fromBlock = toBlock + 1n;
 }
 
 await reconcileOrdersFromFills();
+cleanupIrrelevantCtfEvents();
 db.close();
 console.log(`同步完成：读取 logs=${synced}，解析事件=${decodedCount}`);
 console.log(`数据库：${dbPath}`);

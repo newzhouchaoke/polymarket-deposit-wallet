@@ -165,6 +165,28 @@ export function collateralForOutcome(sell, outcomeAmount) {
   return (outcomeAmount * BigInt(sell.taker_amount)) / BigInt(sell.maker_amount);
 }
 
+export function feeForCashValue(cashValue, feeRateBps) {
+  const rate = BigInt(feeRateBps);
+  if (rate < 0n || rate >= 10_000n) {
+    throw new Error("MATCHER_FEE_RATE_BPS 必须在 0-9999 之间");
+  }
+  return (BigInt(cashValue) * rate) / 10_000n;
+}
+
+async function validateConfiguredFeeRate(publicClient, deployment, abi, feeRateBps) {
+  const maxFeeRateBps = await publicClient.readContract({
+    address: deployment.exchange,
+    abi,
+    functionName: "getMaxFeeRate",
+  });
+  if (BigInt(feeRateBps) > BigInt(maxFeeRateBps)) {
+    throw new Error(
+      `MATCHER_FEE_RATE_BPS=${feeRateBps} 超过链上上限 ${maxFeeRateBps}`,
+    );
+  }
+  return BigInt(maxFeeRateBps);
+}
+
 export function updateFill(db, row, makerFill, takerFill) {
   const nextFilledMaker = BigInt(row.filled_maker_amount ?? "0") + makerFill;
   const nextFilledTaker = BigInt(row.filled_taker_amount ?? "0") + takerFill;
@@ -196,6 +218,10 @@ export function updateFill(db, row, makerFill, takerFill) {
 export async function matchOnce(options = {}) {
   const { dryRun = false, assertLiveAction = true } = options;
   const deployment = loadDeployment({ requireMarket: true });
+  const feeRateBps = Number(process.env.MATCHER_FEE_RATE_BPS ?? "0");
+  if (!Number.isInteger(feeRateBps) || feeRateBps < 0 || feeRateBps >= 10_000) {
+    throw new Error("MATCHER_FEE_RATE_BPS 必须是 0-9999 的整数");
+  }
   const db = openResearchDb();
   try {
     const match = bestMatch(db);
@@ -215,6 +241,10 @@ export async function matchOnce(options = {}) {
       (total, maker) => total + maker.collateralAmount,
       0n,
     );
+    const takerFeeAmount = feeForCashValue(collateralAmount, feeRateBps);
+    const makerFeeAmounts = match.makers.map(({ collateralAmount: cashValue }) =>
+      feeForCashValue(cashValue, feeRateBps),
+    );
     const summary = {
       buyOrderId: match.buy.local_order_id,
       sellOrderIds: match.makers.map(({ sell }) => sell.local_order_id),
@@ -225,6 +255,9 @@ export async function matchOnce(options = {}) {
       tokenId: match.buy.token_id,
       outcomeAmount: outcomeAmount.toString(),
       collateralAmount: collateralAmount.toString(),
+      feeRateBps,
+      takerFeeAmount: takerFeeAmount.toString(),
+      makerFeeAmounts: makerFeeAmounts.map((fee) => fee.toString()),
       makerFills: match.makers.map(({ sell, outcomeAmount: outcome, collateralAmount: collateral }) => ({
         sellOrderId: sell.local_order_id,
         outcomeAmount: outcome.toString(),
@@ -238,6 +271,12 @@ export async function matchOnce(options = {}) {
         transport: amoyTransport(),
       });
       const exchangeArtifact = readCurrentExchangeArtifact(deployment);
+      const maxFeeRateBps = await validateConfiguredFeeRate(
+        publicClient,
+        deployment,
+        exchangeArtifact.abi,
+        feeRateBps,
+      );
       const validation = {};
       for (const [side, row] of [
         ["buy", match.buy],
@@ -271,8 +310,8 @@ export async function matchOnce(options = {}) {
             match.makers.map(({ sell }) => toContractOrder(sell)),
             collateralAmount,
             match.makers.map(({ outcomeAmount: amount }) => amount),
-            0n,
-            match.makers.map(() => 0n),
+            takerFeeAmount,
+            makerFeeAmounts,
           ],
         });
         settlementSimulation = { ready: true };
@@ -288,6 +327,7 @@ export async function matchOnce(options = {}) {
         candidate: summary,
         onchainOrderValidation: validation,
         settlementSimulation,
+        onchainMaxFeeRateBps: maxFeeRateBps.toString(),
       };
     }
 
@@ -304,6 +344,12 @@ export async function matchOnce(options = {}) {
       transport: amoyTransport(),
     });
     const exchangeArtifact = readCurrentExchangeArtifact(deployment);
+    const maxFeeRateBps = await validateConfiguredFeeRate(
+      publicClient,
+      deployment,
+      exchangeArtifact.abi,
+      feeRateBps,
+    );
 
     const buyOrder = toContractOrder(match.buy);
     const sellOrders = match.makers.map(({ sell }) => toContractOrder(sell));
@@ -313,8 +359,8 @@ export async function matchOnce(options = {}) {
       sellOrders,
       collateralAmount,
       match.makers.map(({ outcomeAmount: amount }) => amount),
-      0n,
-      match.makers.map(() => 0n),
+      takerFeeAmount,
+      makerFeeAmounts,
     ];
     const { request } = await publicClient.simulateContract({
       account: signer,
@@ -380,6 +426,7 @@ export async function matchOnce(options = {}) {
       ...summary,
       buyFill,
       sellFills,
+      onchainMaxFeeRateBps: maxFeeRateBps.toString(),
     };
   } finally {
     db.close();

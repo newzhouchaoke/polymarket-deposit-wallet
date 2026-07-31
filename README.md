@@ -297,6 +297,17 @@ npm run db:sync:events
 curl http://127.0.0.1:8787/api/order-fills
 ```
 
+手续费由 Operator 作为 `matchOrders` 参数传入，项目使用与官方 `Fees.sol` 相同的
+`cashValue * feeRateBps / 10000` 公式。BUY 的 cash value 是实际支付抵押币，SELL 的
+cash value 是实际收到抵押币；启动前还会读取 `getMaxFeeRate()`：
+
+```dotenv
+# 50 = 0.5%；默认 0
+MATCHER_FEE_RATE_BPS=50
+```
+
+配置超过链上上限时 dry-run 和 live matcher 都会拒绝执行。
+
 官方模式的 dry-run 会调用所部署 Exchange 的 `validateOrder`，直接在链上校验订单哈希和
 签名。只有钱包已持有对应 pUSD/结果份额并完成授权时，才应启动 live matcher：
 
@@ -350,6 +361,53 @@ npm run official:market:redeem:seller
 npm run chain-sync:once
 npm run chain-sync
 ```
+
+`FULL_SYNC` 默认只写入已有 5 个确认的区块，并为游标保存 block hash：
+
+```dotenv
+SYNC_CONFIRMATIONS=5
+```
+
+每次继续同步前会检查游标区块是否仍在 canonical chain。发现短重组时，同步器寻找最近
+保存的共同区块，删除 orphaned `chain_events`、`order_fills`、成交和操作记录，再从共同
+区块之后重放。手动的“已知交易同步”只做幂等补录，不再错误推进 FULL_SYNC 游标。
+
+### API 鉴权、限流、审计和实时推送
+
+默认 `API_HOST=127.0.0.1` 时可继续本机使用。只要监听非本机地址，服务就会强制要求
+`API_WRITE_TOKEN`：
+
+```dotenv
+API_HOST=127.0.0.1
+API_WRITE_TOKEN=
+API_READ_RATE_LIMIT_PER_MINUTE=300
+API_WRITE_RATE_LIMIT_PER_MINUTE=30
+API_REALTIME_POLL_MS=2000
+```
+
+令牌通过 `Authorization: Bearer ...` 或 `x-api-key` 提交。交易页可以把令牌保存在当前
+浏览器的 `localStorage`。所有 POST 成功和失败记录到 `api_audit_log`，但不保存私钥、
+令牌或完整请求正文：
+
+```bash
+curl http://127.0.0.1:8787/api/audit
+npm run test:api
+```
+
+实时通道为 `ws://127.0.0.1:8787/ws?marketId=...`，连接后立即推送市场、订单簿、最近
+订单和成交快照；API 写入或同步数据库变化时会再次推送。交易页会自动连接和重连。
+
+### Standard / Neg Risk / UMA 模块状态
+
+```bash
+npm run official:modules:status
+curl http://127.0.0.1:8787/api/modules
+```
+
+该检查只读取源码 artifact、部署记录和 Amoy 合约代码，不广播交易。当前 Standard
+Exchange 已就绪；Neg Risk 和 UMA 源码/依赖已就绪，但在本项目中尚未部署，因此状态会
+明确返回 `runtimeReady=false`，不会把官方参考地址伪装成本项目部署。账户余额不足时继续
+使用只读检查，不应为追求“完整”强行消耗真实 POL。
 
 SQLite 文件按运行模式分别位于 `data/research-polymarket.sqlite` 与
 `data/official-v2-polymarket.sqlite`，保存合约、钱包、市场、链下订单、链上成交、余额和事件。

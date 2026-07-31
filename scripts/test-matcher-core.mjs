@@ -5,6 +5,7 @@ import {
   bestMatch,
   bestPair,
   collateralForOutcome,
+  feeForCashValue,
 } from "./matcher-core.mjs";
 
 const db = new DatabaseSync(":memory:");
@@ -60,6 +61,9 @@ assert.equal(
   1_096_000n,
 );
 assert.equal(collateralForOutcome(match.makers[2].sell, 700_000n), 406_000n);
+assert.equal(feeForCashValue(1_096_000n, 50), 5_480n);
+assert.equal(feeForCashValue(250_000n, 0), 0n);
+assert.throws(() => feeForCashValue(1_000n, 10_000), /0-9999/);
 
 const pair = bestPair(db);
 assert.equal(pair.buy.local_order_id, "buy");

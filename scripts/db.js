@@ -133,6 +133,7 @@ export function initSchema(db) {
       chain_id INTEGER NOT NULL,
       tx_hash TEXT NOT NULL,
       block_number INTEGER NOT NULL DEFAULT 0,
+      block_hash TEXT,
       log_index INTEGER NOT NULL DEFAULT 0,
       event_name TEXT NOT NULL,
       contract_address TEXT NOT NULL,
@@ -165,6 +166,7 @@ export function initSchema(db) {
       taker_amount_filled TEXT NOT NULL,
       fee TEXT NOT NULL DEFAULT '0',
       block_number INTEGER NOT NULL DEFAULT 0,
+      block_hash TEXT,
       raw_json TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (chain_id, tx_hash, log_index)
@@ -174,8 +176,31 @@ export function initSchema(db) {
       chain_id INTEGER NOT NULL,
       name TEXT NOT NULL,
       last_block INTEGER NOT NULL,
+      last_block_hash TEXT,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (chain_id, name)
+    );
+
+    CREATE TABLE IF NOT EXISTS chain_blocks (
+      chain_id INTEGER NOT NULL,
+      block_number INTEGER NOT NULL,
+      block_hash TEXT NOT NULL,
+      parent_hash TEXT NOT NULL,
+      processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (chain_id, block_number)
+    );
+
+    CREATE TABLE IF NOT EXISTS api_audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      remote_address TEXT NOT NULL,
+      method TEXT NOT NULL,
+      path TEXT NOT NULL,
+      action TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      status_code INTEGER NOT NULL,
+      request_hash TEXT,
+      details_json TEXT NOT NULL DEFAULT '{}'
     );
 
     CREATE INDEX IF NOT EXISTS idx_orders_market_status
@@ -186,6 +211,10 @@ export function initSchema(db) {
       ON chain_events(chain_id, event_name);
     CREATE INDEX IF NOT EXISTS idx_order_fills_order_hash
       ON order_fills(chain_id, order_hash);
+    CREATE INDEX IF NOT EXISTS idx_api_audit_time
+      ON api_audit_log(occurred_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_chain_blocks_hash
+      ON chain_blocks(chain_id, block_hash);
   `);
 
   const columns = db.prepare("PRAGMA table_info(chain_events)").all();
@@ -215,6 +244,10 @@ export function initSchema(db) {
         ON chain_events(chain_id, event_name);
     `);
   }
+  const currentEventColumns = db.prepare("PRAGMA table_info(chain_events)").all();
+  if (!currentEventColumns.some((column) => column.name === "block_hash")) {
+    db.exec("ALTER TABLE chain_events ADD COLUMN block_hash TEXT;");
+  }
 
   const marketColumns = db.prepare("PRAGMA table_info(markets)").all();
   if (!marketColumns.some((column) => column.name === "creator")) {
@@ -239,6 +272,14 @@ export function initSchema(db) {
   const orderColumns = db.prepare("PRAGMA table_info(orders)").all();
   if (!orderColumns.some((column) => column.name === "filled_maker_amount")) {
     db.exec("ALTER TABLE orders ADD COLUMN filled_maker_amount TEXT NOT NULL DEFAULT '0';");
+  }
+  const fillColumns = db.prepare("PRAGMA table_info(order_fills)").all();
+  if (!fillColumns.some((column) => column.name === "block_hash")) {
+    db.exec("ALTER TABLE order_fills ADD COLUMN block_hash TEXT;");
+  }
+  const syncColumns = db.prepare("PRAGMA table_info(sync_state)").all();
+  if (!syncColumns.some((column) => column.name === "last_block_hash")) {
+    db.exec("ALTER TABLE sync_state ADD COLUMN last_block_hash TEXT;");
   }
   if (!orderColumns.some((column) => column.name === "filled_taker_amount")) {
     db.exec("ALTER TABLE orders ADD COLUMN filled_taker_amount TEXT NOT NULL DEFAULT '0';");

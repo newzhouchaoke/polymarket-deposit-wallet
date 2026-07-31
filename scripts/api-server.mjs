@@ -4,9 +4,11 @@ import { spawn } from "node:child_process";
 import { URL } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
+import { WebSocketServer } from "ws";
 import { dbMode, dbPath, initSchema, openDatabase, projectDir } from "./db.js";
 import { readMatcherStatus } from "./matcher-core.mjs";
 import { orderHashFor, sideNumber } from "./order-utils.mjs";
+import { officialModulesStatus } from "./official-modules-status.mjs";
 import {
   loadExchangeConfig,
   runtimeSummary,
@@ -24,6 +26,21 @@ const db = openDatabase();
 initSchema(db);
 const exchangeConfig = loadExchangeConfig();
 const exchangeRuntime = runtimeSummary(exchangeConfig);
+const writeToken = String(process.env.API_WRITE_TOKEN ?? "").trim();
+const readRateLimit = Number(process.env.API_READ_RATE_LIMIT_PER_MINUTE ?? "300");
+const writeRateLimit = Number(process.env.API_WRITE_RATE_LIMIT_PER_MINUTE ?? "30");
+const realtimePollMs = Number(process.env.API_REALTIME_POLL_MS ?? "2000");
+const rateWindows = new Map();
+const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
+
+if (!loopbackHosts.has(host) && !writeToken) {
+  throw new Error(
+    "API 监听非本机地址时必须配置 API_WRITE_TOKEN，避免未授权链上写入",
+  );
+}
+if (!Number.isInteger(realtimePollMs) || realtimePollMs < 500) {
+  throw new Error("API_REALTIME_POLL_MS 必须是 >= 500 的整数毫秒");
+}
 
 function rows(sql, params = {}) {
   return db.prepare(sql).all(params).map(parseJsonColumns);
@@ -36,7 +53,7 @@ function one(sql, params = {}) {
 
 function parseJsonColumns(row) {
   const parsed = { ...row };
-  for (const key of ["raw_json", "args_json"]) {
+  for (const key of ["raw_json", "args_json", "details_json"]) {
     if (typeof parsed[key] === "string") {
       try {
         parsed[key] = JSON.parse(parsed[key]);
@@ -46,6 +63,100 @@ function parseJsonColumns(row) {
     }
   }
   return parsed;
+}
+
+function remoteAddress(req) {
+  return req.socket.remoteAddress ?? "unknown";
+}
+
+function consumeRateLimit(req, write) {
+  const maximum = write ? writeRateLimit : readRateLimit;
+  if (!Number.isInteger(maximum) || maximum < 1) {
+    throw new Error("API rate limit 必须是正整数");
+  }
+  const key = `${remoteAddress(req)}:${write ? "write" : "read"}`;
+  const now = Date.now();
+  const current = rateWindows.get(key);
+  const windowState =
+    !current || now - current.startedAt >= 60_000
+      ? { startedAt: now, count: 0 }
+      : current;
+  windowState.count += 1;
+  rateWindows.set(key, windowState);
+  return {
+    allowed: windowState.count <= maximum,
+    maximum,
+    remaining: Math.max(0, maximum - windowState.count),
+    resetAt: windowState.startedAt + 60_000,
+  };
+}
+
+function suppliedWriteToken(req) {
+  const authorization = String(req.headers.authorization ?? "");
+  if (/^Bearer\s+/i.test(authorization)) {
+    return authorization.replace(/^Bearer\s+/i, "").trim();
+  }
+  return String(req.headers["x-api-key"] ?? "").trim();
+}
+
+function secureEqual(left, right) {
+  const a = Buffer.from(left);
+  const b = Buffer.from(right);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function authorizeWrite(req) {
+  if (!writeToken) {
+    const address = remoteAddress(req);
+    if (
+      address === "127.0.0.1" ||
+      address === "::1" ||
+      address === "::ffff:127.0.0.1"
+    ) {
+      return "local";
+    }
+    throw Object.assign(new Error("未配置 API_WRITE_TOKEN，只允许本机写入"), {
+      statusCode: 401,
+    });
+  }
+  if (!secureEqual(suppliedWriteToken(req), writeToken)) {
+    throw Object.assign(new Error("缺少或无效的 API 写入令牌"), {
+      statusCode: 401,
+    });
+  }
+  return "token";
+}
+
+function auditAction(req, url, statusCode, action, actor, body = {}) {
+  const safeDetails = {
+    confirmation: body.confirmation ?? null,
+    outcome: body.outcome ?? null,
+    role: body.role ?? null,
+    localOrderId: body.localOrderId ?? null,
+    marketId: body.marketId ?? null,
+  };
+  const requestHash = crypto
+    .createHash("sha256")
+    .update(JSON.stringify(body))
+    .digest("hex");
+  db.prepare(
+    `INSERT INTO api_audit_log(
+       remote_address, method, path, action, actor, status_code,
+       request_hash, details_json
+     ) VALUES(
+       :remoteAddress, :method, :path, :action, :actor, :statusCode,
+       :requestHash, :detailsJson
+     )`,
+  ).run({
+    remoteAddress: remoteAddress(req),
+    method: req.method ?? "UNKNOWN",
+    path: url.pathname,
+    action,
+    actor,
+    statusCode,
+    requestHash,
+    detailsJson: JSON.stringify(safeDetails),
+  });
 }
 
 function json(res, status, data) {
@@ -588,6 +699,8 @@ function indexPage() {
     ["/api/orderbook", "订单簿"],
     ["/api/trades", "成交"],
     ["/api/order-fills", "逐订单链上成交"],
+    ["/api/audit", "API 写操作审计"],
+    ["/api/modules", "Standard / Neg Risk / UMA 状态"],
     ["/api/balances", "余额"],
     ["/api/events", "链上事件"],
     ["/api/matcher/status", "自动撮合状态"],
@@ -728,6 +841,7 @@ function tradePage() {
     <div class="card"><div class="label">卖方钱包</div><div class="value mono" id="metric-seller">${escapeHtml(short(seller, 8))}</div></div>
     <div class="card"><div class="label">自动撮合</div><div class="value" id="metric-matcher">加载中</div></div>
     <div class="card"><div class="label">链上同步</div><div class="value" id="metric-chain-sync">加载中</div></div>
+    <div class="card"><div class="label">实时推送</div><div class="value" id="metric-realtime">连接中</div></div>
   </section>
 
   <section class="layout">
@@ -761,6 +875,9 @@ function tradePage() {
             ? "生成签名订单只写官方模式数据库；撮合会调用官方 V2 ABI，取消只作用于本地订单簿。"
             : "生成签名订单只写数据库；链上撮合/取消会发 Amoy 测试网交易。"
         }</p>
+        <label>API 写入令牌（仅在服务器配置 API_WRITE_TOKEN 时填写）</label>
+        <input id="api-write-token" type="password" autocomplete="off" placeholder="保存在当前浏览器 localStorage" />
+        <button id="save-api-token" type="button" class="secondary">保存令牌</button>
         <button id="seed-signed" type="button">生成签名订单</button>
         <button id="match-chain" type="button" class="warn">撮合一轮</button>
         <button id="sync-db" type="button" class="secondary">同步事件/余额</button>
@@ -967,9 +1084,12 @@ function tradePage() {
     }
 
     async function postJson(url, body = {}) {
+      const token = localStorage.getItem("polymarketApiWriteToken") || "";
+      const headers = { "content-type": "application/json" };
+      if (token) headers.authorization = "Bearer " + token;
       const response = await fetch(url, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers,
         body: JSON.stringify(body),
       });
       const json = await response.json();
@@ -1046,6 +1166,14 @@ function tradePage() {
 
     document.querySelector("#seed-signed").addEventListener("click", () => {
       runAction("生成签名订单", () => postJson("/api/orders/seed-signed"));
+    });
+    const apiTokenInput = document.querySelector("#api-write-token");
+    apiTokenInput.value = localStorage.getItem("polymarketApiWriteToken") || "";
+    document.querySelector("#save-api-token").addEventListener("click", () => {
+      const token = apiTokenInput.value.trim();
+      if (token) localStorage.setItem("polymarketApiWriteToken", token);
+      else localStorage.removeItem("polymarketApiWriteToken");
+      actionStatus.textContent = token ? "API 写入令牌已保存在当前浏览器" : "API 写入令牌已清除";
     });
     document.querySelector("#match-chain").addEventListener("click", () => {
       if (!confirm("确认在 Amoy 测试网上发起链上撮合交易？")) return;
@@ -1134,6 +1262,12 @@ function tradePage() {
     marketSelect.addEventListener("change", () => {
       form.elements.marketId.value = activeMarket().market_id || "";
       setTokenFromKind();
+      if (realtimeSocket?.readyState === WebSocket.OPEN) {
+        realtimeSocket.send(JSON.stringify({
+          type: "subscribe",
+          marketId: activeMarket().market_id,
+        }));
+      }
       refresh().catch((error) => { result.textContent = String(error); });
     });
     tokenKind.addEventListener("change", setTokenFromKind);
@@ -1154,8 +1288,40 @@ function tradePage() {
       if (!data.signature) delete data.signature;
       runAction("提交数据库订单", () => postJson("/api/orders", data));
     });
+    let realtimeRefreshTimer;
+    let realtimeSocket;
+    function connectRealtime() {
+      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      const marketId = encodeURIComponent(activeMarket().market_id || "");
+      const socket = new WebSocket(protocol + "//" + location.host + "/ws?marketId=" + marketId);
+      realtimeSocket = socket;
+      socket.addEventListener("open", () => {
+        document.querySelector("#metric-realtime").textContent = "已连接";
+      });
+      socket.addEventListener("message", (event) => {
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type !== "snapshot") return;
+          document.querySelector("#metric-realtime").textContent = "实时";
+          clearTimeout(realtimeRefreshTimer);
+          realtimeRefreshTimer = setTimeout(() => {
+            refresh().catch((error) => { result.textContent = String(error); });
+          }, 100);
+        } catch {
+          document.querySelector("#metric-realtime").textContent = "消息错误";
+        }
+      });
+      socket.addEventListener("close", () => {
+        document.querySelector("#metric-realtime").textContent = "重连中";
+        setTimeout(connectRealtime, 2000);
+      });
+      socket.addEventListener("error", () => {
+        document.querySelector("#metric-realtime").textContent = "连接失败";
+      });
+    }
     setPreset("BUY");
     refresh().catch((error) => { result.textContent = String(error); });
+    connectRealtime();
     setInterval(() => {
       if (document.querySelector("#auto-refresh").checked) {
         refresh().catch((error) => { result.textContent = String(error); });
@@ -1405,6 +1571,7 @@ const routes = {
       orders: one("SELECT COUNT(*) AS count FROM orders").count,
       trades: one("SELECT COUNT(*) AS count FROM trades").count,
       orderFills: one("SELECT COUNT(*) AS count FROM order_fills").count,
+      apiAudit: one("SELECT COUNT(*) AS count FROM api_audit_log").count,
       tokenBalances: one("SELECT COUNT(*) AS count FROM token_balances").count,
       chainEvents: one("SELECT COUNT(*) AS count FROM chain_events").count,
     },
@@ -1487,6 +1654,12 @@ const routes = {
       params,
     );
   },
+  "/api/audit": (url) =>
+    rows(
+      `SELECT * FROM api_audit_log
+       ORDER BY id DESC LIMIT :limit OFFSET :offset`,
+      { limit: limit(url), offset: offset(url) },
+    ),
   "/api/balances": (url) => {
     const wallet = url.searchParams.get("wallet");
     const symbol = url.searchParams.get("symbol");
@@ -1534,6 +1707,82 @@ const routes = {
   "/api/chain-sync/status": () => readChainSyncStatus(),
 };
 
+const websocketServer = new WebSocketServer({ noServer: true });
+
+function realtimeSnapshot(marketId) {
+  const market = marketId
+    ? one("SELECT * FROM markets WHERE market_id = :marketId", { marketId })
+    : one("SELECT * FROM markets ORDER BY updated_at DESC LIMIT 1");
+  const selectedMarketId = market?.market_id ?? null;
+  return {
+    type: "snapshot",
+    generatedAt: new Date().toISOString(),
+    runtime: exchangeRuntime,
+    market,
+    orderbook: selectedMarketId
+      ? orderbookForMarket(selectedMarketId)
+      : { marketId: null, bids: [], asks: [] },
+    recentOrders: selectedMarketId
+      ? rows(
+          `SELECT local_order_id, order_hash, side, price_micros, status,
+                  filled_maker_amount, filled_taker_amount, updated_at
+           FROM orders
+           WHERE market_id = :marketId
+           ORDER BY updated_at DESC LIMIT 20`,
+          { marketId: selectedMarketId },
+        )
+      : [],
+    recentTrades: selectedMarketId
+      ? rows(
+          `SELECT * FROM trades
+           WHERE market_id = :marketId
+           ORDER BY created_at DESC LIMIT 20`,
+          { marketId: selectedMarketId },
+        )
+      : [],
+  };
+}
+
+function sendRealtime(socket, reason = "snapshot") {
+  if (socket.readyState !== 1) return;
+  socket.send(
+    JSON.stringify({
+      ...realtimeSnapshot(socket.marketId),
+      reason,
+    }),
+  );
+}
+
+function broadcastRealtime(reason) {
+  for (const socket of websocketServer.clients) {
+    sendRealtime(socket, reason);
+  }
+}
+
+websocketServer.on("connection", (socket, request) => {
+  const url = new URL(request.url ?? "/ws", `http://${request.headers.host ?? "localhost"}`);
+  socket.marketId = url.searchParams.get("marketId") ?? exchangeRuntime.marketId;
+  socket.isAlive = true;
+  socket.on("pong", () => {
+    socket.isAlive = true;
+  });
+  socket.on("message", (message) => {
+    try {
+      const parsed = JSON.parse(message.toString());
+      if (parsed.type === "subscribe" && typeof parsed.marketId === "string") {
+        socket.marketId = parsed.marketId;
+        sendRealtime(socket, "subscribed");
+      }
+    } catch {
+      socket.send(JSON.stringify({
+        type: "error",
+        message: "WebSocket 消息必须是 JSON",
+      }));
+    }
+  });
+  sendRealtime(socket, "connected");
+});
+
 function marketOrderbookPath(pathname) {
   const match = pathname.match(/^\/api\/markets\/(.+)\/orderbook$/);
   return match ? decodeURIComponent(match[1]) : null;
@@ -1561,85 +1810,148 @@ function userActionPath(pathname) {
 }
 
 const server = http.createServer(async (req, res) => {
+  let requestUrl;
+  let actor = "anonymous";
+  let requestBody = {};
+  let audited = false;
   try {
     if (!req.url) return badRequest(res, "Missing URL");
     const url = new URL(req.url, `http://${req.headers.host ?? `${host}:${port}`}`);
+    requestUrl = url;
 
     if (req.method === "OPTIONS") {
       res.writeHead(204, {
         "access-control-allow-origin": "*",
         "access-control-allow-methods": "GET, POST, OPTIONS",
-        "access-control-allow-headers": "content-type",
+        "access-control-allow-headers": "content-type, authorization, x-api-key",
       });
       res.end();
       return;
     }
 
+    const rate = consumeRateLimit(req, req.method === "POST");
+    if (!rate.allowed) {
+      res.setHeader("retry-after", String(Math.ceil((rate.resetAt - Date.now()) / 1000)));
+      return json(res, 429, {
+        error: "RATE_LIMITED",
+        message: `请求过于频繁，每分钟最多 ${rate.maximum} 次`,
+        resetAt: new Date(rate.resetAt).toISOString(),
+      });
+    }
+
     if (req.method === "POST") {
+      actor = authorizeWrite(req);
+      const respondAction = (statusCode, action, data) => {
+        auditAction(req, url, statusCode, action, actor, requestBody);
+        audited = true;
+        json(res, statusCode, data);
+        queueMicrotask(() => broadcastRealtime(action));
+      };
       if (url.pathname === "/api/orders/seed-signed") {
-        return json(res, 200, await seedSignedOrders());
+        return respondAction(200, "ORDER_SEED_SIGNED", await seedSignedOrders());
       }
       if (url.pathname === "/api/orders/match-chain") {
-        const body = await readJsonBody(req);
-        return json(res, 200, await matchOrdersOnchain(body));
+        requestBody = await readJsonBody(req);
+        return respondAction(
+          200,
+          "ORDER_MATCH_CHAIN",
+          await matchOrdersOnchain(requestBody),
+        );
       }
       if (url.pathname === "/api/sync") {
-        return json(res, 200, await syncDatabaseFromChain());
+        return respondAction(200, "DATABASE_SYNC", await syncDatabaseFromChain());
       }
       if (url.pathname === "/api/orders") {
-        const body = await readJsonBody(req);
-        return json(res, 201, insertOrder(body));
+        requestBody = await readJsonBody(req);
+        return respondAction(201, "ORDER_CREATE", insertOrder(requestBody));
       }
       const marketAction = marketActionPath(url.pathname);
       if (marketAction) {
-        const body = await readJsonBody(req);
-        return json(
-          res,
+        requestBody = {
+          ...(await readJsonBody(req)),
+          marketId: marketAction.marketId,
+        };
+        return respondAction(
           200,
+          `MARKET_${marketAction.action.toUpperCase()}`,
           await runMarketLifecycle(
             marketAction.marketId,
             marketAction.action,
-            body,
+            requestBody,
           ),
         );
       }
       const userAction = userActionPath(url.pathname);
       if (userAction) {
-        const body = await readJsonBody(req);
-        return json(
-          res,
+        requestBody = {
+          ...(await readJsonBody(req)),
+          role: userAction.role,
+        };
+        return respondAction(
           200,
-          await manageOfficialUser(userAction.role, userAction.action, body),
+          `USER_${userAction.action.toUpperCase()}`,
+          await manageOfficialUser(userAction.role, userAction.action, requestBody),
         );
       }
       const action = orderActionPath(url.pathname);
       if (action?.action === "cancel") {
-        return json(res, 200, cancelOrder(action.localOrderId));
+        requestBody = { localOrderId: action.localOrderId };
+        return respondAction(200, "ORDER_CANCEL_LOCAL", cancelOrder(action.localOrderId));
       }
       if (action?.action === "fill") {
-        const body = await readJsonBody(req);
-        return json(res, 200, fillOrder(action.localOrderId, body));
+        requestBody = {
+          ...(await readJsonBody(req)),
+          localOrderId: action.localOrderId,
+        };
+        return respondAction(
+          200,
+          "ORDER_FILL_LOCAL",
+          fillOrder(action.localOrderId, requestBody),
+        );
       }
       if (action?.action === "cancel-chain") {
-        const body = await readJsonBody(req);
-        return json(res, 200, await cancelOrderOnchain(action.localOrderId, body));
+        requestBody = {
+          ...(await readJsonBody(req)),
+          localOrderId: action.localOrderId,
+        };
+        return respondAction(
+          200,
+          "ORDER_CANCEL_CHAIN",
+          await cancelOrderOnchain(action.localOrderId, requestBody),
+        );
       }
       if (action?.action === "preapprove-chain") {
-        const body = await readJsonBody(req);
-        return json(
-          res,
+        requestBody = {
+          ...(await readJsonBody(req)),
+          localOrderId: action.localOrderId,
+        };
+        return respondAction(
           200,
-          await manageOfficialOrder(action.localOrderId, "preapprove", body),
+          "ORDER_PREAPPROVE",
+          await manageOfficialOrder(
+            action.localOrderId,
+            "preapprove",
+            requestBody,
+          ),
         );
       }
       if (action?.action === "invalidate-chain") {
-        const body = await readJsonBody(req);
-        return json(
-          res,
+        requestBody = {
+          ...(await readJsonBody(req)),
+          localOrderId: action.localOrderId,
+        };
+        return respondAction(
           200,
-          await manageOfficialOrder(action.localOrderId, "invalidate", body),
+          "ORDER_PREAPPROVAL_INVALIDATE",
+          await manageOfficialOrder(
+            action.localOrderId,
+            "invalidate",
+            requestBody,
+          ),
         );
       }
+      auditAction(req, url, 404, "UNKNOWN_WRITE_ROUTE", actor, requestBody);
+      audited = true;
       return notFound(res, url.pathname);
     }
 
@@ -1663,12 +1975,88 @@ const server = http.createServer(async (req, res) => {
     }
 
     const route = routes[url.pathname];
+    if (url.pathname === "/api/modules") {
+      return json(res, 200, await officialModulesStatus());
+    }
     if (!route) return notFound(res, url.pathname);
     return json(res, 200, route(url));
   } catch (error) {
+    const statusCode = Number(error?.statusCode ?? 500);
+    if (
+      req.method === "POST" &&
+      requestUrl &&
+      !audited
+    ) {
+      auditAction(
+        req,
+        requestUrl,
+        statusCode,
+        "WRITE_FAILED",
+        actor,
+        requestBody,
+      );
+    }
+    if (statusCode === 401) {
+      return json(res, 401, {
+        error: "UNAUTHORIZED",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
     return internalError(res, error);
   }
 });
+
+server.on("upgrade", (request, socket, head) => {
+  try {
+    const url = new URL(
+      request.url ?? "/",
+      `http://${request.headers.host ?? `${host}:${port}`}`,
+    );
+    if (url.pathname !== "/ws") {
+      socket.destroy();
+      return;
+    }
+    websocketServer.handleUpgrade(request, socket, head, (websocket) => {
+      websocketServer.emit("connection", websocket, request);
+    });
+  } catch {
+    socket.destroy();
+  }
+});
+
+let realtimeFingerprint = "";
+function currentRealtimeFingerprint() {
+  const state = one(
+    `SELECT
+       (SELECT COUNT(*) FROM orders) AS order_count,
+       (SELECT COALESCE(MAX(updated_at), '') FROM orders) AS order_updated,
+       (SELECT COUNT(*) FROM trades) AS trade_count,
+       (SELECT COALESCE(MAX(created_at), '') FROM trades) AS trade_updated,
+       (SELECT COUNT(*) FROM chain_events) AS event_count,
+       (SELECT COALESCE(MAX(block_number), 0) FROM chain_events) AS event_block`,
+  );
+  return JSON.stringify(state);
+}
+const realtimePoll = setInterval(() => {
+  const next = currentRealtimeFingerprint();
+  if (realtimeFingerprint && next !== realtimeFingerprint) {
+    broadcastRealtime("database-updated");
+  }
+  realtimeFingerprint = next;
+}, realtimePollMs);
+realtimePoll.unref();
+
+const websocketHeartbeat = setInterval(() => {
+  for (const socket of websocketServer.clients) {
+    if (!socket.isAlive) {
+      socket.terminate();
+      continue;
+    }
+    socket.isAlive = false;
+    socket.ping();
+  }
+}, 30_000);
+websocketHeartbeat.unref();
 
 server.listen(port, host, () => {
   console.log(
@@ -1678,6 +2066,10 @@ server.listen(port, host, () => {
 });
 
 function shutdown() {
+  clearInterval(realtimePoll);
+  clearInterval(websocketHeartbeat);
+  for (const socket of websocketServer.clients) socket.close(1001, "server shutdown");
+  websocketServer.close();
   server.close(() => {
     db.close();
     process.exit(0);
