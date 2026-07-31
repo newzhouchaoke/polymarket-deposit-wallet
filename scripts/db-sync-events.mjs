@@ -20,6 +20,7 @@ import {
   orderHashFor,
   toContractOrder,
 } from "./order-utils.mjs";
+import { syncAllReservations } from "./order-risk.mjs";
 
 dotenv.config({ path: path.join(projectDir, "..", ".env"), quiet: true });
 dotenv.config({ path: path.join(projectDir, ".env"), override: true, quiet: true });
@@ -649,7 +650,8 @@ function updateOrderPreapproval(event, txHash, invalidated) {
      SET preapproved = :preapproved,
          invalidated = :invalidated,
          status = CASE
-           WHEN :invalidated = 1 AND status IN ('OPEN', 'PARTIALLY_FILLED')
+           WHEN :invalidated = 1
+             AND status IN ('OPEN', 'PARTIALLY_FILLED', 'USER_PAUSED')
              THEN 'CANCELLED'
            ELSE status
          END,
@@ -955,6 +957,7 @@ async function syncKnownTransactions() {
   }
 
   await reconcileOrdersFromFills();
+  syncAllReservations(db);
   console.log(`已同步已知交易 ${txHashes.length} 笔，解析事件 ${decodedCount} 条`);
   console.log("已知交易同步不会推进 FULL_SYNC 的确认区块游标");
   console.log(`数据库：${dbPath}`);
@@ -999,6 +1002,7 @@ if (fromBlock > chainSafeBlock) {
   console.log(
     `已是最新确认状态：last_block=${state?.last_block ?? 0}, safe=${chainSafeBlock}, latest=${chainLatestBlock}, confirmations=${confirmations}`,
   );
+  syncAllReservations(db);
   db.close();
   process.exit(0);
 }
@@ -1043,6 +1047,7 @@ while (fromBlock <= latestBlock) {
 }
 
 await reconcileOrdersFromFills();
+syncAllReservations(db);
 cleanupIrrelevantCtfEvents();
 db.close();
 console.log(`同步完成：读取 logs=${synced}，解析事件=${decodedCount}`);

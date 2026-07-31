@@ -17,6 +17,7 @@ const commonEnvironment = {
   POLYMARKET_DB_PATH: testDatabasePath,
   HEALTH_REQUIRE_CHAIN_SYNC: "false",
   API_REQUIRE_SIGNED_ORDERS: "false",
+  API_ENFORCE_BALANCE_RESERVATIONS: "false",
 };
 const importResult = spawnSync("node", ["scripts/db-import-runtime.mjs"], {
   cwd: projectDir,
@@ -32,7 +33,7 @@ const child = spawn("node", ["scripts/api-server.mjs"], {
     API_HOST: "127.0.0.1",
     API_WRITE_TOKEN: token,
     API_READ_RATE_LIMIT_PER_MINUTE: "100",
-    API_WRITE_RATE_LIMIT_PER_MINUTE: "6",
+    API_WRITE_RATE_LIMIT_PER_MINUTE: "8",
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -145,6 +146,11 @@ try {
   const createdOrder = await created.json();
   assert.equal(createdOrder.idempotent, false);
   assert.equal(createdOrder.validation_status, "UNSIGNED");
+  assert.equal(createdOrder.risk.enforced, false);
+  const reservations = await fetch(
+    `http://127.0.0.1:${port}/api/reservations?wallet=${order.maker}`,
+  ).then((response) => response.json());
+  assert.equal(reservations.totals[0].reservedAmount, order.makerAmount);
 
   const repeated = await fetch(`http://127.0.0.1:${port}/api/orders`, {
     method: "POST",
@@ -156,6 +162,41 @@ try {
   });
   assert.equal(repeated.status, 200);
   assert.equal((await repeated.json()).idempotent, true);
+
+  const partiallyFilled = await fetch(
+    `http://127.0.0.1:${port}/api/orders/${order.localOrderId}/fill`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        makerFillAmount: "100000",
+        takerFillAmount: "200000",
+      }),
+    },
+  );
+  assert.equal(partiallyFilled.status, 200);
+  assert.equal((await partiallyFilled.json()).status, "PARTIALLY_FILLED");
+  const reducedReservations = await fetch(
+    `http://127.0.0.1:${port}/api/reservations?wallet=${order.maker}`,
+  ).then((response) => response.json());
+  assert.equal(reducedReservations.totals[0].reservedAmount, "400000");
+
+  const cancelled = await fetch(
+    `http://127.0.0.1:${port}/api/orders/${order.localOrderId}/cancel`,
+    {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+    },
+  );
+  assert.equal(cancelled.status, 200);
+  assert.equal((await cancelled.json()).status, "CANCELLED");
+  const releasedReservations = await fetch(
+    `http://127.0.0.1:${port}/api/reservations?wallet=${order.maker}`,
+  ).then((response) => response.json());
+  assert.equal(releasedReservations.totals.length, 0);
 
   const conflict = await fetch(`http://127.0.0.1:${port}/api/orders`, {
     method: "POST",

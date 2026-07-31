@@ -18,6 +18,7 @@ import {
   readJsonStatus,
   statusWithLiveness,
 } from "./service-utils.mjs";
+import { syncOrderReservation } from "./order-risk.mjs";
 
 export const matcherStatusPath = path.join(
   projectDir,
@@ -213,6 +214,7 @@ export function updateFill(db, row, makerFill, takerFill) {
     filledMakerAmount: nextFilledMaker.toString(),
     filledTakerAmount: nextFilledTaker.toString(),
   });
+  syncOrderReservation(db, row.local_order_id, row.chain_id);
   return {
     status,
     filledMakerAmount: nextFilledMaker.toString(),

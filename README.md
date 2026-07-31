@@ -385,6 +385,7 @@ API_WRITE_RATE_LIMIT_PER_MINUTE=30
 API_REALTIME_POLL_MS=2000
 API_REQUIRE_SIGNED_ORDERS=true
 API_VALIDATE_SIGNED_ORDERS=true
+API_ENFORCE_BALANCE_RESERVATIONS=true
 ORDER_EXPIRY_SWEEP_MS=10000
 HEALTH_REQUIRE_CHAIN_SYNC=true
 SERVICE_STATUS_STALE_MS=180000
@@ -408,6 +409,21 @@ npm run test:api
 已有记录，不会把已经部分成交或取消的订单重置为 `OPEN`；同一个 `localOrderId` 指向
 不同订单时返回 HTTP 409。
 
+official-v2 还会在下单时执行资金预占检查。BUY 使用 Maker 的抵押币余额与 Exchange
+allowance 两者中的较小值；SELL 使用对应 ERC-1155 tokenId 的余额，并要求 Exchange
+已经获得 operator approval。后端再扣除同一 Maker 其他活动订单已经预占的 makerAmount，
+不足时返回 `ORDER_RISK_REJECTED`（HTTP 422），不会写入订单簿。这个过程只执行 `eth_call`，
+不发送交易、不消耗 POL。
+
+预占额会随部分成交减少，在完全成交、本地取消、链上取消或过期后释放；`USER_PAUSED`
+订单继续保留预占，防止恢复交易前把同一资产重复下单。可查询：
+
+```bash
+curl "http://127.0.0.1:8787/api/reservations"
+curl "http://127.0.0.1:8787/api/reservations?wallet=0x..."
+npm run test:risk
+```
+
 订单保存 `VALID`、`INVALID`、`LOCALLY_SIGNED`、`LEGACY_SIGNED`、`UNSIGNED` 或
 `VALIDATION_SKIPPED` 校验状态。现有活动签名订单可以批量重新校验：
 
@@ -417,7 +433,8 @@ curl http://127.0.0.1:8787/api/orders/stats
 ```
 
 该命令只读取 Amoy Exchange 并更新本地数据库，不发送交易。API 每 10 秒把到期的
-`OPEN/PARTIALLY_FILLED` 订单更新为 `EXPIRED`，WebSocket 随后推送新订单簿。
+`OPEN/PARTIALLY_FILLED/USER_PAUSED` 订单更新为 `EXPIRED`，释放预占后通过 WebSocket
+推送新订单簿。
 
 ### MetaMask 浏览器签名
 
@@ -431,8 +448,9 @@ curl http://127.0.0.1:8787/api/orders/stats
 5. 后端使用官方 V2 Exchange 的只读 `validateOrder` 验签，通过后才写入订单簿。
 
 浏览器不会读取或上传私钥。余额面板使用 `eth_call` 显示账户 POL、Maker 的抵押币、
-结果代币、ERC-20 allowance 和 ERC-1155 operator approval；当前仅检查授权，不会自动
-发授权交易。Safe(2) 和 ERC-1271(3) 需要各自的包装/多签流程，页面保留手动签名方式，
+结果代币、ERC-20 allowance、ERC-1155 operator approval、活动订单预占和扣除预占后的
+可用额度；当前仅检查授权，不会自动发授权交易。Safe(2) 和 ERC-1271(3) 需要各自的
+包装/多签流程，页面保留手动签名方式，
 不会把普通 MetaMask 签名错误标记成这两种类型。
 
 如果 Chrome 同时安装 Phantom 和 MetaMask，页面通过 EIP-6963 与
@@ -492,7 +510,8 @@ Exchange 已就绪；Neg Risk 和 UMA 源码/依赖已就绪，但在本项目�
 使用只读检查，不应为追求“完整”强行消耗真实 POL。
 
 SQLite 文件按运行模式分别位于 `data/research-polymarket.sqlite` 与
-`data/official-v2-polymarket.sqlite`，保存合约、钱包、市场、链下订单、链上成交、余额和事件。
+`data/official-v2-polymarket.sqlite`，保存合约、钱包、市场、链下订单、订单资金预占、
+链上成交、余额和事件。
 
 ## 安全边界
 

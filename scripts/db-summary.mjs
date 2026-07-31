@@ -19,6 +19,7 @@ console.log(
       wallets: count("wallets"),
       markets: count("markets"),
       orders: count("orders"),
+      orderReservations: count("order_reservations"),
       trades: count("trades"),
       tokenBalances: count("token_balances"),
       chainEvents: count("chain_events"),
@@ -36,6 +37,16 @@ console.table(
 console.log("\nOrders");
 console.table(
   all(`SELECT local_order_id, side, maker, token_id, maker_amount, taker_amount, price_micros, status FROM orders`),
+);
+
+console.log("\nReservations");
+console.table(
+  all(
+    `SELECT local_order_id, wallet_address, asset_type, token_id,
+            reserved_amount, status, release_reason
+     FROM order_reservations
+     ORDER BY updated_at DESC`,
+  ),
 );
 
 console.log("\nTrades");

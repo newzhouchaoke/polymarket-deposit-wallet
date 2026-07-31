@@ -13,6 +13,7 @@ import {
   readExchangeArtifact,
   researchDeploymentPath,
 } from "./exchange-config.mjs";
+import { syncOrderReservation } from "./order-risk.mjs";
 
 dotenv.config({ path: path.join(projectDir, "..", ".env"), quiet: true });
 dotenv.config({ path: path.join(projectDir, ".env"), override: true, quiet: true });
@@ -212,6 +213,7 @@ export function insertDbOrder(db, deployment, localOrderId, order, signature, st
       updatedAt: now,
     },
   );
+  syncOrderReservation(db, localOrderId, Number(deployment.chainId));
 }
 
 export function toContractOrder(row) {

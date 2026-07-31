@@ -11,6 +11,14 @@ import { readMatcherStatus } from "./matcher-core.mjs";
 import { expireOrders, orderStats } from "./order-maintenance.mjs";
 import { orderHashFor, sideNumber } from "./order-utils.mjs";
 import { validateSignedOrder } from "./order-validation.mjs";
+import {
+  assertReservationCapacity,
+  readChainCapacity,
+  reservationSpec,
+  reservationSummary,
+  syncAllReservations,
+  syncOrderReservation,
+} from "./order-risk.mjs";
 import { officialModulesStatus } from "./official-modules-status.mjs";
 import { readJsonStatus, statusWithLiveness } from "./service-utils.mjs";
 import {
@@ -30,6 +38,7 @@ const db = openDatabase();
 initSchema(db);
 const exchangeConfig = loadExchangeConfig();
 const exchangeRuntime = runtimeSummary(exchangeConfig);
+syncAllReservations(db);
 const writeToken = String(process.env.API_WRITE_TOKEN ?? "").trim();
 const readRateLimit = Number(process.env.API_READ_RATE_LIMIT_PER_MINUTE ?? "300");
 const writeRateLimit = Number(process.env.API_WRITE_RATE_LIMIT_PER_MINUTE ?? "30");
@@ -43,6 +52,11 @@ const requireSignedOrders =
   ).toLowerCase() === "true";
 const validateSignedOrders =
   String(process.env.API_VALIDATE_SIGNED_ORDERS ?? "true").toLowerCase() === "true";
+const enforceBalanceReservations =
+  String(
+    process.env.API_ENFORCE_BALANCE_RESERVATIONS ??
+      (exchangeRuntime.mode === "official-v2" ? "true" : "false"),
+  ).toLowerCase() === "true";
 const orderExpirySweepMs = Number(process.env.ORDER_EXPIRY_SWEEP_MS ?? "10000");
 const rateWindows = new Map();
 const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
@@ -505,20 +519,7 @@ async function insertOrder(order) {
     });
   }
 
-  db.prepare(
-    `INSERT INTO orders(
-       chain_id, local_order_id, market_id, maker, signer, side, token_id,
-       maker_amount, taker_amount, filled_maker_amount, filled_taker_amount,
-       price_micros, status, expiration, salt, signature, order_hash,
-       validation_status, validation_error, validated_at, raw_json, updated_at
-     )
-     VALUES(
-       :chainId, :localOrderId, :marketId, :maker, :signer, :side, :tokenId,
-       :makerAmount, :takerAmount, :filledMakerAmount, :filledTakerAmount,
-       :priceMicros, :status, :expiration, :salt, :signature, :orderHash,
-       :validationStatus, :validationError, :validatedAt, :rawJson, CURRENT_TIMESTAMP
-     )`,
-  ).run({
+  const insertParams = {
     chainId: market.chain_id,
     localOrderId: id,
     marketId: normalized.marketId,
@@ -540,11 +541,81 @@ async function insertOrder(order) {
     validationError: validation.error,
     validatedAt: validation.validatedAt,
     rawJson: JSON.stringify(normalized),
+  };
+  const candidateSpec = reservationSpec({
+    chain_id: market.chain_id,
+    local_order_id: id,
+    maker: normalized.maker,
+    side: normalized.side,
+    token_id: normalized.tokenId,
+    maker_amount: normalized.makerAmount,
+    filled_maker_amount: normalized.filledMakerAmount,
+    status: normalized.status,
   });
+  let chainRisk = null;
+  if (enforceBalanceReservations) {
+    try {
+      const chainCapacity = await readChainCapacity(exchangeConfig, candidateSpec);
+      chainRisk = {
+        ...assertReservationCapacity(db, candidateSpec, chainCapacity.capacity),
+        balance: chainCapacity.balance.toString(),
+        allowance: chainCapacity.allowance?.toString() ?? null,
+        approvedForAll: chainCapacity.approvedForAll,
+      };
+    } catch (error) {
+      if (error?.statusCode) throw error;
+      const wrapped = new Error(
+        `无法读取链上余额/授权，订单未进入订单簿：${
+          error instanceof Error ? error.message.split("\n")[0] : String(error)
+        }`,
+      );
+      wrapped.statusCode = 503;
+      wrapped.code = "RISK_CAPACITY_UNAVAILABLE";
+      throw wrapped;
+    }
+  }
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (enforceBalanceReservations) {
+      const capacity = BigInt(chainRisk.chainCapacity);
+      chainRisk = {
+        ...chainRisk,
+        ...assertReservationCapacity(db, candidateSpec, capacity),
+      };
+    }
+    db.prepare(
+      `INSERT INTO orders(
+         chain_id, local_order_id, market_id, maker, signer, side, token_id,
+         maker_amount, taker_amount, filled_maker_amount, filled_taker_amount,
+         price_micros, status, expiration, salt, signature, order_hash,
+         validation_status, validation_error, validated_at, raw_json, updated_at
+       )
+       VALUES(
+         :chainId, :localOrderId, :marketId, :maker, :signer, :side, :tokenId,
+         :makerAmount, :takerAmount, :filledMakerAmount, :filledTakerAmount,
+         :priceMicros, :status, :expiration, :salt, :signature, :orderHash,
+         :validationStatus, :validationError, :validatedAt, :rawJson, CURRENT_TIMESTAMP
+       )`,
+    ).run(insertParams);
+    syncOrderReservation(db, id, market.chain_id);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 
   return {
     ...one("SELECT * FROM orders WHERE local_order_id = :id", { id }),
     idempotent: false,
+    risk: {
+      enforced: enforceBalanceReservations,
+      ...(chainRisk ?? {
+        assetType: candidateSpec.assetType,
+        tokenId: candidateSpec.tokenId,
+        required: candidateSpec.reservedAmount.toString(),
+      }),
+    },
   };
 }
 
@@ -555,14 +626,17 @@ function orderById(localOrderId) {
 function cancelOrder(localOrderId) {
   const order = orderById(localOrderId);
   if (!order) throw new Error(`Unknown order: ${localOrderId}`);
-  if (!["OPEN", "PARTIALLY_FILLED"].includes(order.status)) {
-    throw new Error(`Only OPEN/PARTIALLY_FILLED orders can be cancelled. Current: ${order.status}`);
+  if (!["OPEN", "PARTIALLY_FILLED", "USER_PAUSED"].includes(order.status)) {
+    throw new Error(
+      `Only OPEN/PARTIALLY_FILLED/USER_PAUSED orders can be cancelled. Current: ${order.status}`,
+    );
   }
   db.prepare(
     `UPDATE orders
      SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP
      WHERE local_order_id = :localOrderId`,
   ).run({ localOrderId });
+  syncOrderReservation(db, localOrderId, order.chain_id);
   return orderById(localOrderId);
 }
 
@@ -596,6 +670,7 @@ function fillOrder(localOrderId, body) {
     filledTakerAmount: nextFilledTaker,
     status: nextStatus,
   });
+  syncOrderReservation(db, localOrderId, order.chain_id);
   return orderById(localOrderId);
 }
 
@@ -833,6 +908,7 @@ function indexPage() {
     ["/api/markets", "市场"],
     ["/api/orders", "订单"],
     ["/api/orders/stats", "订单状态与签名校验统计"],
+    ["/api/reservations", "活动订单资金预占"],
     ["/api/markets/:id/orderbook", "指定市场订单簿"],
     ["/api/orderbook", "订单簿"],
     ["/api/trades", "成交"],
@@ -1176,6 +1252,7 @@ function tradePage() {
       buildOrderForWallet,
       connectWallet as connectBrowserWallet,
       findMetaMaskProvider,
+      formatUnits,
       isAmoyChainId,
       normalizeChainId,
       readWalletAssets,
@@ -1296,21 +1373,71 @@ function tradePage() {
       if (!connectedAccount) throw new Error("请先连接 MetaMask");
       if (!activeWalletProvider) throw new Error("MetaMask Provider 尚未选择");
       const maker = form.elements.maker.value.trim();
-      const snapshot = await readWalletAssets(
-        activeWalletProvider,
-        runtime,
-        maker,
-        connectedAccount,
-        form.elements.tokenId.value,
+      const tokenId = form.elements.tokenId.value;
+      const [snapshot, reservationState] = await Promise.all([
+        readWalletAssets(
+          activeWalletProvider,
+          runtime,
+          maker,
+          connectedAccount,
+          tokenId,
+        ),
+        fetch("/api/reservations?wallet=" + encodeURIComponent(maker))
+          .then(async (response) => {
+            const json = await response.json();
+            if (!response.ok) throw new Error(json.message || "读取预占失败");
+            return json;
+          }),
+      ]);
+      const collateralReservation = reservationState.totals.find(
+        (item) => item.assetType === "COLLATERAL",
       );
+      const outcomeReservation = reservationState.totals.find(
+        (item) => item.assetType === "OUTCOME" && item.tokenId === tokenId,
+      );
+      const reservedCollateralRaw = BigInt(
+        collateralReservation?.reservedAmount || "0",
+      );
+      const reservedOutcomeRaw = BigInt(
+        outcomeReservation?.reservedAmount || "0",
+      );
+      const collateralBalanceRaw = BigInt(snapshot.makerCollateralRaw);
+      const collateralAllowanceRaw = BigInt(
+        snapshot.makerCollateralAllowanceRaw,
+      );
+      const collateralCapacityRaw =
+        collateralBalanceRaw < collateralAllowanceRaw
+          ? collateralBalanceRaw
+          : collateralAllowanceRaw;
+      const outcomeCapacityRaw = snapshot.outcomeApprovedForExchange
+        ? BigInt(snapshot.makerOutcomeRaw)
+        : 0n;
+      const remaining = (capacity, reserved) =>
+        capacity > reserved ? capacity - reserved : 0n;
+      const decimals = Number(runtime.collateralDecimals || 6);
       walletAssets.textContent = JSON.stringify({
         connectedAccount,
         maker,
-        tokenId: form.elements.tokenId.value,
+        tokenId,
         collateralSymbol: runtime.collateralSymbol,
         ...snapshot,
+        reservations: {
+          collateral: formatUnits(reservedCollateralRaw, decimals),
+          selectedOutcome: formatUnits(reservedOutcomeRaw, decimals),
+          activeOrderCount: reservationState.reservations.length,
+        },
+        availableAfterReservations: {
+          collateral: formatUnits(
+            remaining(collateralCapacityRaw, reservedCollateralRaw),
+            decimals,
+          ),
+          selectedOutcome: formatUnits(
+            remaining(outcomeCapacityRaw, reservedOutcomeRaw),
+            decimals,
+          ),
+        },
       }, null, 2);
-      return snapshot;
+      return { ...snapshot, reservations: reservationState };
     }
 
     function handleWalletAccountsChanged(accounts) {
@@ -1366,8 +1493,14 @@ function tradePage() {
     }
 
     async function signAndSubmitBrowserOrder() {
+      if (!activeWalletProvider) {
+        const candidate = await findMetaMaskProvider(window);
+        bindWalletProvider(candidate);
+      }
       if (!connectedAccount) {
-        updateConnectedAccount(await connectBrowserWallet(window.ethereum));
+        updateConnectedAccount(
+          await connectBrowserWallet(activeWalletProvider),
+        );
       }
       const formValues = Object.fromEntries(new FormData(form).entries());
       const { typedData, payload } = buildOrderForWallet(
@@ -1427,7 +1560,11 @@ function tradePage() {
         const filled = item.filled_maker_amount + "/" + item.maker_amount + " | " + item.filled_taker_amount + "/" + item.taker_amount;
         const signature = item.signature ? "yes" : "no";
         const validation = item.validation_status || "UNVERIFIED";
-        const canCancel = (item.status === "OPEN" || item.status === "PARTIALLY_FILLED") && item.signature;
+        const canCancel = (
+          item.status === "OPEN" ||
+          item.status === "PARTIALLY_FILLED" ||
+          item.status === "USER_PAUSED"
+        ) && item.signature;
         const cancelButton = canCancel ? '<button class="mini warn cancel-row" data-id="' + item.local_order_id + '">取消</button>' : '';
         const copyButton = '<button class="mini secondary use-row" data-id="' + item.local_order_id + '">选中</button>';
         return "<tr><td><code>" + item.local_order_id + "</code></td><td>" + sidePill(item.side) + "</td><td>" + item.price_micros + "</td><td>" + filled + "</td><td>" + statusPill(item.status) + "</td><td>" + signature + "</td><td>" + validation + "</td><td class='nowrap'>" + copyButton + cancelButton + "</td></tr>";
@@ -1948,6 +2085,10 @@ function serviceMetrics() {
         `SELECT COUNT(*) AS count FROM orders
          WHERE status IN ('OPEN', 'PARTIALLY_FILLED')`,
       ).count,
+      activeReservations: one(
+        `SELECT COUNT(*) AS count FROM order_reservations
+         WHERE status = 'ACTIVE'`,
+      ).count,
       trades: one("SELECT COUNT(*) AS count FROM trades").count,
       chainEvents: one("SELECT COUNT(*) AS count FROM chain_events").count,
       orderStats: orderStats(db),
@@ -1974,6 +2115,9 @@ const routes = {
       orders: one("SELECT COUNT(*) AS count FROM orders").count,
       trades: one("SELECT COUNT(*) AS count FROM trades").count,
       orderFills: one("SELECT COUNT(*) AS count FROM order_fills").count,
+      activeReservations: one(
+        "SELECT COUNT(*) AS count FROM order_reservations WHERE status = 'ACTIVE'",
+      ).count,
       apiAudit: one("SELECT COUNT(*) AS count FROM api_audit_log").count,
       tokenBalances: one("SELECT COUNT(*) AS count FROM token_balances").count,
       chainEvents: one("SELECT COUNT(*) AS count FROM chain_events").count,
@@ -2011,6 +2155,16 @@ const routes = {
     );
   },
   "/api/orders/stats": () => orderStats(db),
+  "/api/reservations": (url) => {
+    const walletAddress = url.searchParams.get("wallet");
+    try {
+      return reservationSummary(db, walletAddress);
+    } catch {
+      throw Object.assign(new Error("wallet 必须是有效 EVM 地址"), {
+        statusCode: 400,
+      });
+    }
+  },
   "/api/orderbook": (url) => {
     const requestedMarketId = url.searchParams.get("marketId");
     const market = requestedMarketId
@@ -2425,16 +2579,18 @@ const server = http.createServer(async (req, res) => {
         message: error instanceof Error ? error.message : String(error),
       });
     }
-    if ([400, 409, 413, 422].includes(statusCode)) {
+    if ([400, 409, 413, 422, 503].includes(statusCode)) {
       const names = {
         400: "BAD_REQUEST",
         409: "CONFLICT",
         413: "PAYLOAD_TOO_LARGE",
         422: "ORDER_VALIDATION_FAILED",
+        503: "SERVICE_UNAVAILABLE",
       };
       return json(res, statusCode, {
-        error: names[statusCode],
+        error: error?.code ?? names[statusCode],
         message: error instanceof Error ? error.message : String(error),
+        ...(error?.details ? { details: error.details } : {}),
       });
     }
     return internalError(res, error);

@@ -164,8 +164,11 @@ const assets = await readWalletAssets(provider, runtime, proxy, account, "7");
 assert.deepEqual(assets, {
   accountPOL: "1",
   makerCollateral: "2",
+  makerCollateralRaw: "2000000",
   makerCollateralAllowance: "3",
+  makerCollateralAllowanceRaw: "3000000",
   makerOutcome: "4",
+  makerOutcomeRaw: "4000000",
   outcomeApprovedForExchange: true,
 });
 

@@ -317,8 +317,11 @@ export async function readWalletAssets(provider, runtime, maker, account, tokenI
   return {
     accountPOL: formatUnits(BigInt(pol), 18),
     makerCollateral: formatUnits(collateral, decimals),
+    makerCollateralRaw: collateral.toString(),
     makerCollateralAllowance: formatUnits(collateralAllowance, decimals),
+    makerCollateralAllowanceRaw: collateralAllowance.toString(),
     makerOutcome: formatUnits(outcome, decimals),
+    makerOutcomeRaw: outcome.toString(),
     outcomeApprovedForExchange: approved !== 0n,
   };
 }

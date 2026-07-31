@@ -177,6 +177,23 @@ export function initSchema(db) {
       PRIMARY KEY (chain_id, tx_hash, log_index)
     );
 
+    CREATE TABLE IF NOT EXISTS order_reservations (
+      chain_id INTEGER NOT NULL,
+      local_order_id TEXT NOT NULL,
+      wallet_address TEXT NOT NULL,
+      asset_type TEXT NOT NULL CHECK (asset_type IN ('COLLATERAL', 'OUTCOME')),
+      token_id TEXT NOT NULL DEFAULT '',
+      original_amount TEXT NOT NULL,
+      reserved_amount TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'RELEASED')),
+      release_reason TEXT,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (chain_id, local_order_id),
+      FOREIGN KEY (chain_id, local_order_id)
+        REFERENCES orders(chain_id, local_order_id)
+        ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS sync_state (
       chain_id INTEGER NOT NULL,
       name TEXT NOT NULL,
@@ -216,6 +233,10 @@ export function initSchema(db) {
       ON chain_events(chain_id, event_name);
     CREATE INDEX IF NOT EXISTS idx_order_fills_order_hash
       ON order_fills(chain_id, order_hash);
+    CREATE INDEX IF NOT EXISTS idx_order_reservations_capacity
+      ON order_reservations(
+        chain_id, wallet_address, asset_type, token_id, status
+      );
     CREATE INDEX IF NOT EXISTS idx_api_audit_time
       ON api_audit_log(occurred_at DESC);
     CREATE INDEX IF NOT EXISTS idx_chain_blocks_hash

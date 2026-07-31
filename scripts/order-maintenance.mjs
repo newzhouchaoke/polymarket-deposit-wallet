@@ -1,11 +1,14 @@
+import { syncAllReservations } from "./order-risk.mjs";
+
 export function expireOrders(db, nowSeconds = Math.floor(Date.now() / 1000)) {
   const result = db.prepare(
     `UPDATE orders
      SET status = 'EXPIRED', updated_at = CURRENT_TIMESTAMP
-     WHERE status IN ('OPEN', 'PARTIALLY_FILLED')
+     WHERE status IN ('OPEN', 'PARTIALLY_FILLED', 'USER_PAUSED')
        AND expiration > 0
        AND expiration <= :nowSeconds`,
   ).run({ nowSeconds });
+  if (Number(result.changes ?? 0) > 0) syncAllReservations(db);
   return Number(result.changes ?? 0);
 }
 
