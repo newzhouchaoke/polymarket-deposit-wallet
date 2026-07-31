@@ -419,6 +419,26 @@ curl http://127.0.0.1:8787/api/orders/stats
 该命令只读取 Amoy Exchange 并更新本地数据库，不发送交易。API 每 10 秒把到期的
 `OPEN/PARTIALLY_FILLED` 订单更新为 `EXPIRED`，WebSocket 随后推送新订单簿。
 
+### MetaMask 浏览器签名
+
+交易页 `http://127.0.0.1:8787/trade` 可以直接连接 EIP-1193 钱包：
+
+1. 点击“连接 MetaMask”，页面检查并切换到 Polygon Amoy（chainId `80002`）。
+2. 选择 EOA(0) 或官方 Proxy(1) 签名类型。
+3. EOA 模式自动把 maker/signer 设置为当前账户；Proxy 模式保留 Deposit Wallet maker，
+   signer 使用当前账户。
+4. 点击“MetaMask 签名并提交”，钱包执行 `eth_signTypedData_v4`。
+5. 后端使用官方 V2 Exchange 的只读 `validateOrder` 验签，通过后才写入订单簿。
+
+浏览器不会读取或上传私钥。余额面板使用 `eth_call` 显示账户 POL、Maker 的抵押币、
+结果代币、ERC-20 allowance 和 ERC-1155 operator approval；当前仅检查授权，不会自动
+发授权交易。Safe(2) 和 ERC-1271(3) 需要各自的包装/多签流程，页面保留手动签名方式，
+不会把普通 MetaMask 签名错误标记成这两种类型。
+
+```bash
+npm run test:frontend
+```
+
 ### 健康检查、指标和故障退避
 
 ```bash

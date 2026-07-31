@@ -194,6 +194,14 @@ function html(res, body) {
   res.end(body);
 }
 
+function javascript(res, body) {
+  res.writeHead(200, {
+    "content-type": "text/javascript; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  res.end(body);
+}
+
 function notFound(res, pathname) {
   json(res, 404, {
     error: "NOT_FOUND",
@@ -1002,6 +1010,15 @@ function tradePage() {
       </div>
 
       <div class="card">
+        <h2>MetaMask / 浏览器钱包</h2>
+        <p class="muted small">连接后自动切换 Polygon Amoy。浏览器 EIP-712 签名支持 EOA(0) 和官方 Proxy(1)，不会发送链上交易。</p>
+        <button id="connect-wallet" type="button">连接 MetaMask</button>
+        <button id="refresh-wallet-assets" type="button" class="secondary">刷新余额/授权</button>
+        <div id="wallet-status" class="status">尚未连接钱包</div>
+        <pre id="wallet-assets">连接后显示账户 POL、Maker pUSD、结果代币余额和 Exchange 授权。</pre>
+      </div>
+
+      <div class="card">
         <h2>快捷操作</h2>
         <p class="muted small">${
           officialRuntime
@@ -1097,6 +1114,7 @@ function tradePage() {
           <label>signature（${officialRuntime ? "官方模式默认必填，入库前调用 validateOrder" : "可选；无签名订单不能链上撮合"}）</label>
           <input name="signature" value="" />
           <button type="submit">${officialRuntime ? "校验并提交签名订单" : "提交订单"}</button>
+          <button id="sign-submit-order" type="button">MetaMask 签名并提交</button>
         </form>
       </div>
 
@@ -1152,9 +1170,18 @@ function tradePage() {
     </div>
   </section>
   </main>
-  <script>
+  <script type="module">
+    import {
+      AMOY_CHAIN_HEX,
+      buildOrderForWallet,
+      connectWallet as connectBrowserWallet,
+      readWalletAssets,
+      signOrderTypedData,
+    } from "/assets/trade-wallet.js";
+
     const markets = ${JSON.stringify(markets)};
     const runtimeMode = ${JSON.stringify(exchangeRuntime.mode)};
+    const runtime = ${JSON.stringify(exchangeRuntime)};
     const buyerWallet = "${escapeHtml(buyer)}";
     const sellerWallet = "${escapeHtml(seller)}";
     const form = document.querySelector("#order-form");
@@ -1169,6 +1196,9 @@ function tradePage() {
     const balancesBody = document.querySelector("#balances-table tbody");
     const actionStatus = document.querySelector("#action-status");
     const actionButtons = Array.from(document.querySelectorAll("button"));
+    const walletStatus = document.querySelector("#wallet-status");
+    const walletAssets = document.querySelector("#wallet-assets");
+    let connectedAccount = null;
 
     function shortText(value, size = 8) {
       const text = String(value || "");
@@ -1196,16 +1226,21 @@ function tradePage() {
       form.elements.tokenId.value = market.yes_token_id || "";
       form.elements.salt.value = String(Date.now());
       form.elements.signature.value = "";
+      const browserSignatureType = Number(form.elements.signatureType.value);
       if (side === "BUY") {
         form.elements.maker.value = buyerWallet;
-        form.elements.signer.value = buyerWallet;
+        form.elements.signer.value = connectedAccount || buyerWallet;
         form.elements.makerAmount.value = "600000";
         form.elements.takerAmount.value = "1000000";
       } else {
         form.elements.maker.value = sellerWallet;
-        form.elements.signer.value = sellerWallet;
+        form.elements.signer.value = connectedAccount || sellerWallet;
         form.elements.makerAmount.value = "1000000";
         form.elements.takerAmount.value = "560000";
+      }
+      if (connectedAccount && browserSignatureType === 0) {
+        form.elements.maker.value = connectedAccount;
+        form.elements.signer.value = connectedAccount;
       }
     }
 
@@ -1235,6 +1270,80 @@ function tradePage() {
       const json = await response.json();
       if (!response.ok || json.error) throw new Error(JSON.stringify(json, null, 2));
       return json;
+    }
+
+    function updateConnectedAccount(account) {
+      connectedAccount = account || null;
+      walletStatus.className = "status";
+      walletStatus.textContent = connectedAccount
+        ? "已连接 Amoy：" + connectedAccount
+        : "尚未连接钱包";
+      if (!connectedAccount) return;
+      form.elements.signer.value = connectedAccount;
+      if (Number(form.elements.signatureType.value) === 0) {
+        form.elements.maker.value = connectedAccount;
+      }
+      form.elements.signature.value = "";
+    }
+
+    async function refreshBrowserWalletAssets() {
+      if (!connectedAccount) throw new Error("请先连接 MetaMask");
+      const maker = form.elements.maker.value.trim();
+      const snapshot = await readWalletAssets(
+        window.ethereum,
+        runtime,
+        maker,
+        connectedAccount,
+        form.elements.tokenId.value,
+      );
+      walletAssets.textContent = JSON.stringify({
+        connectedAccount,
+        maker,
+        tokenId: form.elements.tokenId.value,
+        collateralSymbol: runtime.collateralSymbol,
+        ...snapshot,
+      }, null, 2);
+      return snapshot;
+    }
+
+    async function connectAndRefreshWallet() {
+      const account = await connectBrowserWallet(window.ethereum);
+      updateConnectedAccount(account);
+      await refreshBrowserWalletAssets();
+      return {
+        account,
+        chainId: AMOY_CHAIN_HEX,
+        message: "MetaMask 已连接 Polygon Amoy",
+      };
+    }
+
+    async function signAndSubmitBrowserOrder() {
+      if (!connectedAccount) {
+        updateConnectedAccount(await connectBrowserWallet(window.ethereum));
+      }
+      const formValues = Object.fromEntries(new FormData(form).entries());
+      const { typedData, payload } = buildOrderForWallet(
+        runtime,
+        formValues,
+        connectedAccount,
+      );
+      const signature = await signOrderTypedData(
+        window.ethereum,
+        connectedAccount,
+        typedData,
+      );
+      form.elements.maker.value = payload.maker;
+      form.elements.signer.value = payload.signer;
+      form.elements.signature.value = signature;
+      const created = await postJson("/api/orders", {
+        ...payload,
+        signature,
+      });
+      return {
+        account: connectedAccount,
+        typedData,
+        created,
+      };
     }
 
     async function refresh() {
@@ -1303,6 +1412,49 @@ function tradePage() {
       } finally {
         actionButtons.forEach((button) => { button.disabled = false; });
       }
+    }
+
+    document.querySelector("#connect-wallet").addEventListener("click", () => {
+      runAction("连接 MetaMask", connectAndRefreshWallet);
+    });
+    document.querySelector("#refresh-wallet-assets").addEventListener("click", () => {
+      runAction("读取钱包余额/授权", refreshBrowserWalletAssets);
+    });
+    document.querySelector("#sign-submit-order").addEventListener("click", () => {
+      runAction("MetaMask EIP-712 签名并提交", signAndSubmitBrowserOrder);
+    });
+    form.elements.signatureType.addEventListener("change", () => {
+      form.elements.signature.value = "";
+      if (!connectedAccount) return;
+      const signatureType = Number(form.elements.signatureType.value);
+      form.elements.signer.value = connectedAccount;
+      if (signatureType === 0) {
+        form.elements.maker.value = connectedAccount;
+      } else if (signatureType === 1) {
+        form.elements.maker.value =
+          form.elements.side.value === "SELL" ? sellerWallet : buyerWallet;
+      }
+    });
+    if (window.ethereum?.on) {
+      window.ethereum.on("accountsChanged", (accounts) => {
+        updateConnectedAccount(accounts?.[0] || null);
+        if (connectedAccount) {
+          refreshBrowserWalletAssets().catch((error) => {
+            walletAssets.textContent = String(error);
+          });
+        }
+      });
+      window.ethereum.on("chainChanged", (chainId) => {
+        walletStatus.className = chainId.toLowerCase() === AMOY_CHAIN_HEX
+          ? "status"
+          : "status error";
+        walletStatus.textContent =
+          (connectedAccount ? connectedAccount + " · " : "") +
+          (chainId.toLowerCase() === AMOY_CHAIN_HEX
+            ? "Polygon Amoy"
+            : "网络已变化，请重新连接并切换到 Polygon Amoy");
+        form.elements.signature.value = "";
+      });
     }
 
     document.querySelector("#seed-signed").addEventListener("click", () => {
@@ -2191,6 +2343,15 @@ const server = http.createServer(async (req, res) => {
       return badRequest(res, "Only GET/POST is supported");
     }
 
+    if (url.pathname === "/assets/trade-wallet.js") {
+      return javascript(
+        res,
+        fs.readFileSync(
+          path.join(projectDir, "public", "trade-wallet.js"),
+          "utf8",
+        ),
+      );
+    }
     if (url.pathname === "/" || url.pathname === "/index.html") {
       return html(res, indexPage());
     }

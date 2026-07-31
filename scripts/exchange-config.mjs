@@ -306,6 +306,7 @@ export function runtimeSummary(config = loadExchangeConfig()) {
     collateral: config.collateral,
     ctf: config.ctf,
     collateralSymbol: config.collateralSymbol,
+    collateralDecimals: Number(config.collateralDecimals ?? 6),
     marketConfigured: Boolean(config.market),
     marketId: config.market?.marketId ?? null,
     conditionId: config.market?.conditionId ?? null,

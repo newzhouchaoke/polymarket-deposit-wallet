@@ -77,6 +77,33 @@ try {
   await waitForServer();
   const summary = await fetch(`http://127.0.0.1:${port}/api/summary`);
   assert.equal(summary.status, 200);
+  const trade = await fetch(`http://127.0.0.1:${port}/trade`);
+  assert.equal(trade.status, 200);
+  const tradeHtml = await trade.text();
+  assert.ok(tradeHtml.includes("连接 MetaMask"));
+  assert.ok(tradeHtml.includes("/assets/trade-wallet.js"));
+  const browserModule = tradeHtml.match(
+    /<script type="module">([\s\S]*?)<\/script>/,
+  )?.[1];
+  assert.ok(browserModule);
+  const browserModulePath = path.join(temporaryDirectory, "trade-page.mjs");
+  fs.writeFileSync(browserModulePath, browserModule);
+  const browserSyntax = spawnSync("node", ["--check", browserModulePath], {
+    encoding: "utf8",
+  });
+  assert.equal(
+    browserSyntax.status,
+    0,
+    browserSyntax.stderr || browserSyntax.stdout,
+  );
+  const walletClient = await fetch(
+    `http://127.0.0.1:${port}/assets/trade-wallet.js`,
+  );
+  assert.equal(walletClient.status, 200);
+  assert.match(
+    walletClient.headers.get("content-type") ?? "",
+    /text\/javascript/,
+  );
   const live = await fetch(`http://127.0.0.1:${port}/api/health/live`);
   assert.equal(live.status, 200);
   assert.equal((await live.json()).ok, true);
