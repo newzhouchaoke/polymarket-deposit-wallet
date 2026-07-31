@@ -23,10 +23,39 @@ function requireProvider(provider) {
   return provider;
 }
 
+export function normalizeChainId(value) {
+  try {
+    if (typeof value === "number") return Number.isSafeInteger(value) ? value : null;
+    const text = String(value ?? "").trim();
+    if (!text) return null;
+    return Number(BigInt(text));
+  } catch {
+    return null;
+  }
+}
+
+export function isAmoyChainId(value) {
+  return normalizeChainId(value) === AMOY_CHAIN_ID;
+}
+
+async function confirmAmoy(provider) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const current = await provider.request({ method: "eth_chainId" });
+    if (isAmoyChainId(current)) return current;
+    if (attempt < 4) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+  }
+  const actual = await provider.request({ method: "eth_chainId" });
+  throw new Error(
+    `钱包网络切换未生效：当前 chainId=${actual}，需要 Polygon Amoy chainId=${AMOY_CHAIN_ID}`,
+  );
+}
+
 export async function ensureAmoy(provider) {
   requireProvider(provider);
-  const current = String(await provider.request({ method: "eth_chainId" })).toLowerCase();
-  if (current === AMOY_CHAIN_HEX) return;
+  const current = await provider.request({ method: "eth_chainId" });
+  if (isAmoyChainId(current)) return current;
   try {
     await provider.request({
       method: "wallet_switchEthereumChain",
@@ -44,16 +73,21 @@ export async function ensureAmoy(provider) {
         blockExplorerUrls: ["https://amoy.polygonscan.com"],
       }],
     });
+    await provider.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: AMOY_CHAIN_HEX }],
+    });
   }
+  return confirmAmoy(provider);
 }
 
 export async function connectWallet(provider) {
   requireProvider(provider);
-  await ensureAmoy(provider);
   const accounts = await provider.request({ method: "eth_requestAccounts" });
   if (!Array.isArray(accounts) || !accounts[0]) {
     throw new Error("钱包没有返回可用账户");
   }
+  await ensureAmoy(provider);
   return accounts[0];
 }
 
@@ -177,6 +211,7 @@ export function formatUnits(value, decimals) {
 
 export async function readWalletAssets(provider, runtime, maker, account, tokenId) {
   requireProvider(provider);
+  await ensureAmoy(provider);
   const balanceOf = `0x70a08231${encodeAddress(maker)}`;
   const allowance =
     `0xdd62ed3e${encodeAddress(maker)}${encodeAddress(runtime.exchange)}`;

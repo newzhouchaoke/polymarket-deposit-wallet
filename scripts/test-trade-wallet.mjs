@@ -3,9 +3,19 @@ import {
   AMOY_CHAIN_HEX,
   buildOrderForWallet,
   connectWallet,
+  ensureAmoy,
+  isAmoyChainId,
+  normalizeChainId,
   readWalletAssets,
   signOrderTypedData,
 } from "../public/trade-wallet.js";
+
+assert.equal(normalizeChainId("0x13882"), 80002);
+assert.equal(normalizeChainId("0x013882"), 80002);
+assert.equal(normalizeChainId("80002"), 80002);
+assert.equal(normalizeChainId(80002), 80002);
+assert.equal(normalizeChainId("not-a-chain"), null);
+assert.equal(isAmoyChainId("0X13882"), true);
 
 const account = "0x0000000000000000000000000000000000000002";
 const proxy = "0x0000000000000000000000000000000000000003";
@@ -43,6 +53,36 @@ assert.ok(
       call.method === "wallet_switchEthereumChain" &&
       call.params[0].chainId === AMOY_CHAIN_HEX,
   ),
+);
+
+let addFlowChain = "0x1";
+let firstSwitch = true;
+const addFlowCalls = [];
+const addFlowProvider = {
+  async request(request) {
+    addFlowCalls.push(request.method);
+    if (request.method === "eth_chainId") return addFlowChain;
+    if (request.method === "wallet_switchEthereumChain") {
+      if (firstSwitch) {
+        firstSwitch = false;
+        throw Object.assign(new Error("unknown chain"), { code: 4902 });
+      }
+      addFlowChain = request.params[0].chainId;
+      return null;
+    }
+    if (request.method === "wallet_addEthereumChain") return null;
+    throw new Error(`unexpected method ${request.method}`);
+  },
+};
+await ensureAmoy(addFlowProvider);
+assert.equal(addFlowChain, AMOY_CHAIN_HEX);
+assert.deepEqual(
+  addFlowCalls.filter((method) => method.startsWith("wallet_")),
+  [
+    "wallet_switchEthereumChain",
+    "wallet_addEthereumChain",
+    "wallet_switchEthereumChain",
+  ],
 );
 
 const runtime = {

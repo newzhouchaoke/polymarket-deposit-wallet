@@ -1175,6 +1175,8 @@ function tradePage() {
       AMOY_CHAIN_HEX,
       buildOrderForWallet,
       connectWallet as connectBrowserWallet,
+      isAmoyChainId,
+      normalizeChainId,
       readWalletAssets,
       signOrderTypedData,
     } from "/assets/trade-wallet.js";
@@ -1445,14 +1447,15 @@ function tradePage() {
         }
       });
       window.ethereum.on("chainChanged", (chainId) => {
-        walletStatus.className = chainId.toLowerCase() === AMOY_CHAIN_HEX
-          ? "status"
-          : "status error";
+        const onAmoy = isAmoyChainId(chainId);
+        const numericChainId = normalizeChainId(chainId);
+        walletStatus.className = onAmoy ? "status" : "status error";
         walletStatus.textContent =
           (connectedAccount ? connectedAccount + " · " : "") +
-          (chainId.toLowerCase() === AMOY_CHAIN_HEX
-            ? "Polygon Amoy"
-            : "网络已变化，请重新连接并切换到 Polygon Amoy");
+          (onAmoy
+            ? "Polygon Amoy · chainId 80002"
+            : "当前 chainId " + (numericChainId ?? chainId) +
+              "，请重新连接并切换到 Polygon Amoy (80002)");
         form.elements.signature.value = "";
       });
     }
