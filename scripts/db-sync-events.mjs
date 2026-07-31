@@ -11,17 +11,17 @@ import {
 } from "viem";
 import { polygonAmoy } from "viem/chains";
 import { dbPath, initSchema, openDatabase, projectDir, upsert } from "./db.js";
+import {
+  OFFICIAL_MODE,
+  loadExchangeConfig,
+  readExchangeArtifact,
+} from "./exchange-config.mjs";
 
 dotenv.config({ path: path.join(projectDir, "..", ".env"), quiet: true });
 dotenv.config({ path: path.join(projectDir, ".env"), override: true, quiet: true });
 delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
 
-const deploymentPath = path.join(
-  projectDir,
-  "deployments",
-  "research-v2-amoy.json",
-);
-const deployment = JSON.parse(fs.readFileSync(deploymentPath, "utf8"));
+const deployment = loadExchangeConfig();
 const chainId = Number(deployment.chainId);
 
 if (chainId !== 80002) {
@@ -73,37 +73,38 @@ const logClients = logRpcUrls.map((url) => ({
 const db = openDatabase();
 initSchema(db);
 
-const marketAbi = readArtifact("ResearchMarketRegistry").abi;
-const walletCoinAbi = readArtifact("ResearchWalletCoin").abi;
-const outcomeAbi = readArtifact("ResearchOutcomeToken").abi;
-const exchangeAbi = readArtifact("ResearchCLOBExchange").abi;
-
-const addressConfigs = [
-  {
-    address: getAddress(deployment.marketRegistry),
-    contractName: "ResearchMarketRegistry",
-    abi: marketAbi,
-  },
-  {
-    address: getAddress(deployment.walletCoin),
-    contractName: "ResearchWalletCoin",
-    abi: walletCoinAbi,
-  },
-  {
-    address: getAddress(deployment.outcomeToken),
-    contractName: "ResearchOutcomeToken",
-    abi: outcomeAbi,
-  },
-  ...(deployment.exchange
+const exchangeAbi = readExchangeArtifact(deployment).abi;
+const addressConfigs =
+  deployment.mode === OFFICIAL_MODE
     ? [
+        {
+          address: getAddress(deployment.exchange),
+          contractName: `OfficialCTFExchangeV2-${deployment.variant}`,
+          abi: exchangeAbi,
+        },
+      ]
+    : [
+        {
+          address: getAddress(deployment.marketRegistry),
+          contractName: "ResearchMarketRegistry",
+          abi: readArtifact("ResearchMarketRegistry").abi,
+        },
+        {
+          address: getAddress(deployment.walletCoin),
+          contractName: "ResearchWalletCoin",
+          abi: readArtifact("ResearchWalletCoin").abi,
+        },
+        {
+          address: getAddress(deployment.outcomeToken),
+          contractName: "ResearchOutcomeToken",
+          abi: readArtifact("ResearchOutcomeToken").abi,
+        },
         {
           address: getAddress(deployment.exchange),
           contractName: "ResearchCLOBExchange",
           abi: exchangeAbi,
         },
-      ]
-    : []),
-];
+      ];
 const configByAddress = new Map(
   addressConfigs.map((config) => [config.address.toLowerCase(), config]),
 );
@@ -117,18 +118,22 @@ function bigintJson(value) {
 function getSyncState() {
   return db
     .prepare("SELECT last_block FROM sync_state WHERE chain_id = ? AND name = ?")
-    .get(chainId, "research-v2-events");
+    .get(chainId, deployment.syncStateName);
 }
 
 function setSyncState(lastBlock) {
   upsert(
     db,
     `INSERT INTO sync_state(chain_id, name, last_block, updated_at)
-     VALUES(:chainId, 'research-v2-events', :lastBlock, CURRENT_TIMESTAMP)
+     VALUES(:chainId, :name, :lastBlock, CURRENT_TIMESTAMP)
      ON CONFLICT(chain_id, name) DO UPDATE SET
        last_block=excluded.last_block,
        updated_at=excluded.updated_at`,
-    { chainId, lastBlock: Number(lastBlock) },
+    {
+      chainId,
+      name: deployment.syncStateName,
+      lastBlock: Number(lastBlock),
+    },
   );
 }
 
@@ -246,8 +251,31 @@ function upsertTradeFromOrdersMatched(event, txHash) {
   const args = event.args;
   const takerIsBuy = Number(args.side) === 0;
   const existing = db
-    .prepare("SELECT buy_order_id, sell_order_id FROM trades WHERE chain_id = ? AND tx_hash = ?")
+    .prepare("SELECT * FROM trades WHERE chain_id = ? AND tx_hash = ?")
     .get(chainId, txHash);
+  const tokenId = args.tokenId.toString();
+  const market = deployment.market?.marketId
+    ? db
+        .prepare("SELECT market_id FROM markets WHERE chain_id = ? AND market_id = ?")
+        .get(chainId, deployment.market.marketId)
+    : db
+        .prepare(
+          `SELECT market_id
+           FROM markets
+           WHERE chain_id = ? AND (yes_token_id = ? OR no_token_id = ?)
+           ORDER BY updated_at DESC
+           LIMIT 1`,
+        )
+        .get(chainId, tokenId, tokenId);
+  if (!market) {
+    console.warn(
+      `跳过交易入库：tokenId=${tokenId} 尚未关联市场；事件仍保存在 chain_events`,
+    );
+    return;
+  }
+  const unknownCounterparty = "0x0000000000000000000000000000000000000000";
+  const configuredBuyer = deployment.buyerWallet ?? unknownCounterparty;
+  const configuredSeller = deployment.sellerWallet ?? unknownCounterparty;
   upsert(
     db,
     `INSERT INTO trades(
@@ -271,10 +299,14 @@ function upsertTradeFromOrdersMatched(event, txHash) {
     {
       chainId,
       txHash,
-      marketId: deployment.market.marketId,
-      buyer: takerIsBuy ? args.takerOrderMaker : deployment.sellerWallet,
-      seller: takerIsBuy ? deployment.sellerWallet : args.takerOrderMaker,
-      tokenId: args.tokenId.toString(),
+      marketId: existing?.market_id ?? market.market_id,
+      buyer:
+        existing?.buyer ??
+        (takerIsBuy ? args.takerOrderMaker : configuredBuyer),
+      seller:
+        existing?.seller ??
+        (takerIsBuy ? configuredSeller : args.takerOrderMaker),
+      tokenId,
       outcomeAmount: (takerIsBuy ? args.takerAmountFilled : args.makerAmountFilled).toString(),
       collateralAmount: (takerIsBuy ? args.makerAmountFilled : args.takerAmountFilled).toString(),
       buyOrderId: existing?.buy_order_id ?? null,

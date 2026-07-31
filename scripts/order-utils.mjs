@@ -5,35 +5,44 @@ import { getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { dbPath, initSchema, openDatabase, projectDir, upsert } from "./db.js";
 import { CANCEL_TYPES, ORDER_TYPES } from "./erc7739.mjs";
+import {
+  OFFICIAL_MODE,
+  exchangeMode,
+  loadExchangeConfig,
+  officialDeploymentPath,
+  readExchangeArtifact,
+  researchDeploymentPath,
+} from "./exchange-config.mjs";
 
 dotenv.config({ path: path.join(projectDir, "..", ".env"), quiet: true });
 dotenv.config({ path: path.join(projectDir, ".env"), override: true, quiet: true });
 delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
 
-export const deploymentPath = path.join(
-  projectDir,
-  "deployments",
-  "research-v2-amoy.json",
-);
+export const deploymentPath =
+  exchangeMode() === OFFICIAL_MODE
+    ? officialDeploymentPath()
+    : researchDeploymentPath();
 
 export { CANCEL_TYPES, ORDER_TYPES };
 
-export function loadDeployment() {
-  if (!fs.existsSync(deploymentPath)) {
-    throw new Error(`缺少部署记录：${deploymentPath}`);
-  }
-  const deployment = JSON.parse(fs.readFileSync(deploymentPath, "utf8"));
-  if (!deployment.exchange) throw new Error("部署记录缺少 exchange，请先运行 research:simulate 或 research:deploy");
-  if (Number(deployment.chainId) !== 80002) {
-    throw new Error(`仅支持 Polygon Amoy chainId=80002，当前 ${deployment.chainId}`);
-  }
-  return deployment;
+export function loadDeployment(options = {}) {
+  return loadExchangeConfig(options);
 }
 
 export function readArtifact(contractName) {
+  if (
+    contractName === "ResearchCLOBExchange" &&
+    exchangeMode() === OFFICIAL_MODE
+  ) {
+    return readExchangeArtifact();
+  }
   return JSON.parse(
     fs.readFileSync(path.join(projectDir, "artifacts", `${contractName}.json`), "utf8"),
   );
+}
+
+export function readCurrentExchangeArtifact(deployment = loadDeployment()) {
+  return readExchangeArtifact(deployment);
 }
 
 export function privateKey() {
@@ -52,8 +61,11 @@ export function account() {
 }
 
 export function assertMatcherLiveAction() {
-  if (process.env.LIVE_ACTION !== "MATCH_RESEARCH_ORDERS") {
-    throw new Error("链上撮合已拦截：请设置 LIVE_ACTION=MATCH_RESEARCH_ORDERS");
+  if (
+    process.env.LIVE_ACTION !== "MATCH_ORDERS" &&
+    process.env.LIVE_ACTION !== "MATCH_RESEARCH_ORDERS"
+  ) {
+    throw new Error("链上撮合已拦截：请设置 LIVE_ACTION=MATCH_ORDERS");
   }
   if (process.env.LIVE_CONFIRMATION !== "AMOY_TESTNET_ONLY") {
     throw new Error("测试网写入已拦截：请设置 LIVE_CONFIRMATION=AMOY_TESTNET_ONLY");
@@ -101,6 +113,9 @@ export function domainFor(deployment) {
 }
 
 export function insertDbOrder(db, deployment, localOrderId, order, signature, status = "OPEN") {
+  if (!deployment.market) {
+    throw new Error(`${deployment.mode} 尚未配置市场，无法保存订单`);
+  }
   const now = new Date().toISOString();
   const rawJson = JSON.stringify(
     {

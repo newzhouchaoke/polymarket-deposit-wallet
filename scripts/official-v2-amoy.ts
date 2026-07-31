@@ -5,6 +5,7 @@ import {
   formatEther,
   formatGwei,
   getAddress,
+  parseGwei,
   type Address,
   type Hex,
 } from "viem";
@@ -82,6 +83,48 @@ type Candidate = {
   gas: bigint;
   data: Hex;
 };
+
+function gasFeeConfig(
+  rpcMaxFeePerGas: bigint,
+  rpcMaxPriorityFeePerGas?: bigint,
+): {
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas?: bigint;
+  source: "rpc" | "configured-cap";
+} {
+  const configuredMax = value("AMOY_MAX_FEE_GWEI");
+  const configuredPriority = value("AMOY_PRIORITY_FEE_GWEI");
+  const maxFeePerGas = configuredMax
+    ? parseGwei(configuredMax)
+    : rpcMaxFeePerGas;
+  const maxPriorityFeePerGas = configuredPriority
+    ? parseGwei(configuredPriority)
+    : rpcMaxPriorityFeePerGas && rpcMaxPriorityFeePerGas <= maxFeePerGas
+      ? rpcMaxPriorityFeePerGas
+      : configuredMax
+        ? maxFeePerGas
+        : rpcMaxPriorityFeePerGas;
+
+  if (maxFeePerGas <= 0n) {
+    throw new Error("AMOY_MAX_FEE_GWEI 必须大于 0");
+  }
+  if (
+    maxPriorityFeePerGas !== undefined &&
+    (maxPriorityFeePerGas < 0n || maxPriorityFeePerGas > maxFeePerGas)
+  ) {
+    throw new Error(
+      "AMOY_PRIORITY_FEE_GWEI 必须大于等于 0，并且不能超过 AMOY_MAX_FEE_GWEI",
+    );
+  }
+  return {
+    maxFeePerGas,
+    ...(maxPriorityFeePerGas !== undefined
+      ? { maxPriorityFeePerGas }
+      : {}),
+    source:
+      configuredMax || configuredPriority ? "configured-cap" : "rpc",
+  };
+}
 
 function readArtifact(): OfficialArtifact {
   const artifactPath = path.resolve(
@@ -196,9 +239,13 @@ for (const name of variants) {
 }
 
 const fees = await client.estimateFeesPerGas();
-const maxFeePerGas = fees.maxFeePerGas ?? fees.gasPrice;
-if (!maxFeePerGas) throw new Error("RPC 没有返回可用 gas fee");
-const maxPriorityFeePerGas = fees.maxPriorityFeePerGas;
+const rpcMaxFeePerGas = fees.maxFeePerGas ?? fees.gasPrice;
+if (!rpcMaxFeePerGas) throw new Error("RPC 没有返回可用 gas fee");
+const {
+  maxFeePerGas,
+  maxPriorityFeePerGas,
+  source: gasFeeSource,
+} = gasFeeConfig(rpcMaxFeePerGas, fees.maxPriorityFeePerGas);
 const balance = await client.getBalance({ address: account.address });
 const estimatedMaxCost = candidates.reduce(
   (total, candidate) => total + candidate.gas * maxFeePerGas,
@@ -216,7 +263,13 @@ console.log(
       officialCommit: OFFICIAL_COMMIT,
       compiler: "0.8.34",
       optimizerRuns: 1_000_000,
+      gasFeeSource,
+      rpcSuggestedMaxFeePerGasGwei: formatGwei(rpcMaxFeePerGas),
       maxFeePerGasGwei: formatGwei(maxFeePerGas),
+      maxPriorityFeePerGasGwei:
+        maxPriorityFeePerGas === undefined
+          ? null
+          : formatGwei(maxPriorityFeePerGas),
       candidates: candidates.map((candidate) => ({
         variant: candidate.name,
         reference: candidate.reference,

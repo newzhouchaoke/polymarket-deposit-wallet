@@ -4,15 +4,24 @@ import { spawn } from "node:child_process";
 import { URL } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
-import { dbPath, initSchema, openDatabase, projectDir } from "./db.js";
+import { dbMode, dbPath, initSchema, openDatabase, projectDir } from "./db.js";
 import { readMatcherStatus } from "./matcher-core.mjs";
+import {
+  loadExchangeConfig,
+  runtimeSummary,
+} from "./exchange-config.mjs";
 
-const chainSyncStatusPath = path.join(projectDir, "data", "chain-sync-status.json");
+const chainSyncStatusPath = path.join(
+  projectDir,
+  "data",
+  `chain-sync-${dbMode}-status.json`,
+);
 
 const host = process.env.API_HOST ?? "127.0.0.1";
 const port = Number(process.env.API_PORT ?? "8787");
 const db = openDatabase();
 initSchema(db);
+const exchangeRuntime = runtimeSummary(loadExchangeConfig());
 
 function rows(sql, params = {}) {
   return db.prepare(sql).all(params).map(parseJsonColumns);
@@ -398,11 +407,11 @@ async function matchOrdersOnchain(body = {}) {
     throw new Error("链上撮合需要 confirmation=AMOY_TESTNET_ONLY");
   }
   const projectDir = new URL("..", import.meta.url).pathname;
-  const match = await runCommand("node", ["scripts/match-research-orders.mjs"], {
+  const match = await runCommand("node", ["scripts/match-orders.mjs"], {
     cwd: projectDir,
     env: {
       ...process.env,
-      LIVE_ACTION: "MATCH_RESEARCH_ORDERS",
+      LIVE_ACTION: "MATCH_ORDERS",
       LIVE_CONFIRMATION: "AMOY_TESTNET_ONLY",
     },
   });
@@ -472,7 +481,7 @@ function indexPage() {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Research Polymarket API</title>
+  <title>Polymarket ${escapeHtml(exchangeRuntime.mode)} API</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 36px; color: #17212b; }
     h1 { color: #0d47a1; }
@@ -486,7 +495,9 @@ function indexPage() {
   </style>
 </head>
 <body>
-  <h1>Research Polymarket 数据 API</h1>
+  <h1>Polymarket ${escapeHtml(exchangeRuntime.mode)} 数据 API</h1>
+  <p>运行模式：<code>${exchangeRuntime.mode}</code> · Exchange：
+    <code>${exchangeRuntime.exchange}</code></p>
   <p>数据库：<code>${dbPath}</code></p>
   <div class="grid">
     ${Object.entries(summary).map(([key, value]) => `<div class="card"><div>${key}</div><div class="count">${value}</div></div>`).join("")}
@@ -510,6 +521,7 @@ function indexPage() {
 function tradePage() {
   const markets = routes["/api/markets"]();
   const wallets = routes["/api/wallets"]();
+  const officialRuntime = exchangeRuntime.mode === "official-v2";
   const market = markets[0];
   const buyer = wallets.find((wallet) => wallet.wallet_role === "buyer")?.wallet_address ?? "";
   const seller = wallets.find((wallet) => wallet.wallet_role === "seller")?.wallet_address ?? "";
@@ -522,7 +534,7 @@ function tradePage() {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Research Polymarket 交易控制台</title>
+  <title>Polymarket ${escapeHtml(exchangeRuntime.mode)} 交易控制台</title>
   <style>
     :root { color-scheme: light; --blue:#1565c0; --deep:#0d47a1; --line:#dfe5ec; --muted:#667085; --bg:#f5f7fb; --danger:#b42318; --green:#1b5e20; --orange:#8a4b00; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: var(--bg); color: #17212b; }
@@ -578,7 +590,8 @@ function tradePage() {
 </head>
 <body>
   <header>
-    <h1>Research Polymarket 交易页面</h1>
+    <h1>Polymarket ${escapeHtml(exchangeRuntime.mode)} 交易页面</h1>
+    <div>当前 Exchange：<span class="mono">${escapeHtml(exchangeRuntime.exchange)}</span></div>
     <div>市场、订单簿、签名订单、链上撮合、取消订单和余额监控。</div>
     <div class="topline">
       <a href="/dashboard">Dashboard</a>
@@ -613,7 +626,11 @@ function tradePage() {
 
       <div class="card">
         <h2>快捷操作</h2>
-        <p class="muted small">生成签名订单只写数据库；链上撮合/取消会发 Amoy 测试网交易。</p>
+        <p class="muted small">${
+          officialRuntime
+            ? "生成签名订单只写官方模式数据库；撮合会调用官方 V2 ABI，取消只作用于本地订单簿。"
+            : "生成签名订单只写数据库；链上撮合/取消会发 Amoy 测试网交易。"
+        }</p>
         <button id="seed-signed" type="button">生成签名订单</button>
         <button id="match-chain" type="button" class="warn">撮合一轮</button>
         <button id="sync-db" type="button" class="secondary">同步事件/余额</button>
@@ -678,10 +695,17 @@ function tradePage() {
       </div>
 
       <div class="card">
-        <h2>链上取消订单</h2>
+        <h2>${officialRuntime ? "本地取消订单" : "链上取消订单"}</h2>
         <label>local_order_id</label>
         <input id="cancel-id" placeholder="点击订单行可自动填入" />
-        <button id="cancel-chain" type="button" class="warn">链上取消</button>
+        <button id="cancel-order" type="button" class="warn">${
+          officialRuntime ? "从本地订单簿取消" : "链上取消"
+        }</button>
+        ${
+          officialRuntime
+            ? '<p class="muted small">官方 V2 模式下此操作只更新本地订单簿，不调用研究合约的签名取消函数。</p>'
+            : ""
+        }
       </div>
     </div>
 
@@ -712,7 +736,7 @@ function tradePage() {
 
       <div class="card section">
         <h2>最近成交</h2>
-        <div class="table-wrap"><table id="trades-table"><thead><tr><th>Tx</th><th>Buyer</th><th>Seller</th><th class="right">YES/NO</th><th class="right">rWALLET</th></tr></thead><tbody></tbody></table></div>
+        <div class="table-wrap"><table id="trades-table"><thead><tr><th>Tx</th><th>Buyer</th><th>Seller</th><th class="right">YES/NO</th><th class="right">${escapeHtml(exchangeRuntime.collateralSymbol)}</th></tr></thead><tbody></tbody></table></div>
       </div>
 
       <div class="card section">
@@ -724,6 +748,7 @@ function tradePage() {
   </main>
   <script>
     const markets = ${JSON.stringify(markets)};
+    const runtimeMode = ${JSON.stringify(exchangeRuntime.mode)};
     const buyerWallet = "${escapeHtml(buyer)}";
     const sellerWallet = "${escapeHtml(seller)}";
     const form = document.querySelector("#order-form");
@@ -877,9 +902,14 @@ function tradePage() {
     document.querySelector("#sync-db").addEventListener("click", () => {
       runAction("同步事件/余额", () => postJson("/api/sync"));
     });
-    document.querySelector("#cancel-chain").addEventListener("click", () => {
+    document.querySelector("#cancel-order").addEventListener("click", () => {
       const id = document.querySelector("#cancel-id").value.trim();
       if (!id) return alert("请输入 local_order_id");
+      if (runtimeMode === "official-v2") {
+        if (!confirm("确认从本地订单簿取消订单 " + id + "？")) return;
+        runAction("本地取消", () => postJson("/api/orders/" + encodeURIComponent(id) + "/cancel"));
+        return;
+      }
       if (!confirm("确认在 Amoy 测试网上链上取消订单 " + id + "？")) return;
       runAction("链上取消", () => postJson("/api/orders/" + encodeURIComponent(id) + "/cancel-chain", { confirmation: "AMOY_TESTNET_ONLY" }));
     });
@@ -896,7 +926,7 @@ function tradePage() {
       if (!target?.dataset?.id) return;
       document.querySelector("#cancel-id").value = target.dataset.id;
       if (target.classList.contains("cancel-row")) {
-        document.querySelector("#cancel-chain").click();
+        document.querySelector("#cancel-order").click();
       }
     });
 
@@ -975,7 +1005,7 @@ function dashboardPage() {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Research Polymarket Dashboard</title>
+  <title>Polymarket ${escapeHtml(exchangeRuntime.mode)} Dashboard</title>
   <style>
     :root { color-scheme: light; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #f5f7fb; color: #17212b; }
@@ -1006,7 +1036,8 @@ function dashboardPage() {
 </head>
 <body>
   <header>
-    <h1>Research Polymarket Dashboard</h1>
+    <h1>Polymarket ${escapeHtml(exchangeRuntime.mode)} Dashboard</h1>
+    <div class="sub">当前 Exchange：<code>${escapeHtml(exchangeRuntime.exchange)}</code></div>
     <div class="sub">浏览 SQLite 数据库与 Amoy 链上同步事件</div>
     <div class="sub">数据库：<code>${escapeHtml(dbPath)}</code></div>
     <div class="nav">
@@ -1148,6 +1179,7 @@ function orderbookForMarket(marketId) {
 const routes = {
   "/api/summary": () => ({
     dbPath,
+    runtime: exchangeRuntime,
     counts: {
       contracts: one("SELECT COUNT(*) AS count FROM contracts").count,
       wallets: one("SELECT COUNT(*) AS count FROM wallets").count,
@@ -1347,7 +1379,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(port, host, () => {
-  console.log(`Research Polymarket API 已启动：http://${host}:${port}`);
+  console.log(
+    `Polymarket ${exchangeRuntime.mode} API 已启动：http://${host}:${port}`,
+  );
   console.log(`数据库：${dbPath}`);
 });
 

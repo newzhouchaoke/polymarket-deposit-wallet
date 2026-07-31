@@ -8,12 +8,17 @@ import {
   loadDeployment,
   openResearchDb,
   projectDir,
-  readArtifact,
+  readCurrentExchangeArtifact,
   toContractOrder,
   upsert,
 } from "./order-utils.mjs";
+import { dbMode } from "./db.js";
 
-export const matcherStatusPath = path.join(projectDir, "data", "matcher-status.json");
+export const matcherStatusPath = path.join(
+  projectDir,
+  "data",
+  `matcher-${dbMode}-status.json`,
+);
 
 export function amoyRpcUrls() {
   const configured = process.env.AMOY_RPC_URLS || process.env.AMOY_RPC_URL;
@@ -35,6 +40,16 @@ export function amoyTransport() {
     amoyRpcUrls().map((url) => http(url, { retryCount: 1, timeout: 10_000 })),
     { rank: false },
   );
+}
+
+function compactError(error) {
+  const message =
+    error && typeof error === "object" && typeof error.shortMessage === "string"
+      ? error.shortMessage
+      : error instanceof Error
+        ? error.message
+        : String(error);
+  return message.replace(/\s+/g, " ").trim();
 }
 
 export function writeMatcherStatus(status) {
@@ -152,7 +167,7 @@ export function updateFill(db, row, makerFill, takerFill) {
 
 export async function matchOnce(options = {}) {
   const { dryRun = false, assertLiveAction = true } = options;
-  const deployment = loadDeployment();
+  const deployment = loadDeployment({ requireMarket: true });
   const db = openResearchDb();
   try {
     const pair = bestPair(db);
@@ -180,10 +195,61 @@ export async function matchOnce(options = {}) {
     };
 
     if (dryRun) {
+      const publicClient = createPublicClient({
+        chain: polygonAmoy,
+        transport: amoyTransport(),
+      });
+      const exchangeArtifact = readCurrentExchangeArtifact(deployment);
+      const validation = {};
+      for (const [side, row] of [
+        ["buy", pair.buy],
+        ["sell", pair.sell],
+      ]) {
+        try {
+          await publicClient.readContract({
+            address: deployment.exchange,
+            abi: exchangeArtifact.abi,
+            functionName: "validateOrder",
+            args: [toContractOrder(row)],
+          });
+          validation[side] = { valid: true };
+        } catch (error) {
+          validation[side] = {
+            valid: false,
+            error: compactError(error),
+          };
+        }
+      }
+      let settlementSimulation;
+      try {
+        await publicClient.simulateContract({
+          account: account(),
+          address: deployment.exchange,
+          abi: exchangeArtifact.abi,
+          functionName: "matchOrders",
+          args: [
+            deployment.market.conditionId ?? deployment.market.marketId,
+            toContractOrder(pair.buy),
+            [toContractOrder(pair.sell)],
+            collateralAmount,
+            [outcomeAmount],
+            0n,
+            [0n],
+          ],
+        });
+        settlementSimulation = { ready: true };
+      } catch (error) {
+        settlementSimulation = {
+          ready: false,
+          error: compactError(error),
+        };
+      }
       return {
         matched: false,
         dryRun: true,
         candidate: summary,
+        onchainOrderValidation: validation,
+        settlementSimulation,
       };
     }
 
@@ -199,26 +265,27 @@ export async function matchOnce(options = {}) {
       chain: polygonAmoy,
       transport: amoyTransport(),
     });
-    const exchangeArtifact = readArtifact("ResearchCLOBExchange");
+    const exchangeArtifact = readCurrentExchangeArtifact(deployment);
 
     const buyOrder = toContractOrder(pair.buy);
     const sellOrder = toContractOrder(pair.sell);
-    const hash = await walletClient.writeContract({
+    const matchArgs = [
+      deployment.market.conditionId ?? deployment.market.marketId,
+      buyOrder,
+      [sellOrder],
+      collateralAmount,
+      [outcomeAmount],
+      0n,
+      [0n],
+    ];
+    const { request } = await publicClient.simulateContract({
       account: signer,
-      chain: polygonAmoy,
       address: deployment.exchange,
       abi: exchangeArtifact.abi,
       functionName: "matchOrders",
-      args: [
-        deployment.market.conditionId ?? deployment.market.marketId,
-        buyOrder,
-        [sellOrder],
-        collateralAmount,
-        [outcomeAmount],
-        0n,
-        [0n],
-      ],
+      args: matchArgs,
     });
+    const hash = await walletClient.writeContract(request);
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
     if (receipt.status !== "success") throw new Error(`撮合交易失败：${hash}`);
 

@@ -4,7 +4,8 @@ pragma solidity ^0.8.24;
 import {ERC1271} from "@solady/src/accounts/ERC1271.sol";
 
 /*
- * Research-only implementation inspired by Polymarket's public architecture.
+ * Research-only aggregate implementation inspired by Polymarket's public
+ * architecture. It is intentionally isolated under contracts/research/.
  *
  * Important:
  * - This is not Polymarket's production code.

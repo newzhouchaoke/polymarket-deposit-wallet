@@ -2,10 +2,23 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import dotenv from "dotenv";
 
 export const projectDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const dbDir = path.join(projectDir, "data");
-export const dbPath = path.join(dbDir, "research-polymarket.sqlite");
+dotenv.config({ path: path.join(projectDir, "..", ".env"), quiet: true });
+dotenv.config({ path: path.join(projectDir, ".env"), override: true, quiet: true });
+
+export const dbMode =
+  String(process.env.EXCHANGE_MODE ?? "research").trim().toLowerCase() === "official-v2"
+    ? "official-v2"
+    : "research";
+export const dbPath = path.join(
+  dbDir,
+  dbMode === "official-v2"
+    ? "official-v2-polymarket.sqlite"
+    : "research-polymarket.sqlite",
+);
 
 export function openDatabase() {
   fs.mkdirSync(dbDir, { recursive: true });

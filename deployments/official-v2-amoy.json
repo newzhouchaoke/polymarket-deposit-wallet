@@ -1,0 +1,28 @@
+{
+  "version": "official-ctf-exchange-v2",
+  "nonProductionResearchDeployment": true,
+  "license": "BUSL-1.1",
+  "officialCommit": "ccc0596074f4dfd62c944fbca4de252893b82b4b",
+  "compiler": "0.8.34",
+  "optimizerRuns": 1000000,
+  "chainId": 80002,
+  "deployer": "0x4A2268D5047E9A03c4C6A279d833337D9DD1909e",
+  "deployedAt": "2026-07-31T04:30:01.930Z",
+  "contracts": {
+    "standard": {
+      "address": "0xf5d3fb02d8d529190d117aa8bd85a930f8cab5bb",
+      "txHash": "0x77429ed98250e5d914417fcd562476b8d2de9abf0b433cbd7d42780c1adb9dda",
+      "blockNumber": "43653764",
+      "gasUsed": "4831626",
+      "runtimeCodeBytes": 21037,
+      "dependencies": {
+        "collateral": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+        "ctf": "0x69308FB512518e39F9b16112fA8d994F4e2Bf8bB",
+        "ctfCollateral": "0x9c4E1703476E875070EE25b56A58B008CFb8FA78",
+        "outcomeTokenFactory": "0xADa100874d00e3331D00F2007a9c336a65009718",
+        "proxyFactory": "0xEcA1c266193F03d28517a500007738adfb7754d8",
+        "safeFactory": "0xaacFeEa03eb1561C4e67d661e40682Bd20E3541b"
+      }
+    }
+  }
+}

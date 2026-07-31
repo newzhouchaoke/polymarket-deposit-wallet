@@ -1,9 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { projectDir } from "./db.js";
+import { dbMode, projectDir } from "./db.js";
 
-export const chainSyncStatusPath = path.join(projectDir, "data", "chain-sync-status.json");
+export const chainSyncStatusPath = path.join(
+  projectDir,
+  "data",
+  `chain-sync-${dbMode}-status.json`,
+);
 
 const intervalMs = Number(process.env.CHAIN_SYNC_INTERVAL_MS ?? "12000");
 const syncChunkSize = String(process.env.SYNC_CHUNK_SIZE ?? "200");

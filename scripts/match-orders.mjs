@@ -1,6 +1,7 @@
 import { matchOnce } from "./matcher-core.mjs";
 
-const dryRun = process.argv.includes("--dry-run") || process.env.MATCHER_DRY_RUN === "true";
+const dryRun =
+  process.argv.includes("--dry-run") || process.env.MATCHER_DRY_RUN === "true";
 const result = await matchOnce({ dryRun });
 
 if (result.matched) {

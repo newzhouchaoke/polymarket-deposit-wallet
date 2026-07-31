@@ -1,0 +1,29 @@
+{
+  "marketId": "0xf3e937950ab29fe6569c3e6eec2c711d10f31d6a857dbcb9c268aebd66d26683",
+  "conditionId": "0xf3e937950ab29fe6569c3e6eec2c711d10f31d6a857dbcb9c268aebd66d26683",
+  "questionId": "0xc3445b3ddfe3fc8f5a9c7f7d80c35c4f9942678a71b92d7b7551e925d6fc2a82",
+  "oracle": "0x4A2268D5047E9A03c4C6A279d833337D9DD1909e",
+  "question": "Amoy official V2 research market 2026-07-31",
+  "yesTokenId": "22408280417022442420650579458087485466598314439715060331586918554093282724507",
+  "noTokenId": "89548863889656197514811929627912463060773281505092380866904507194114383115429",
+  "closeTime": 0,
+  "status": "OPEN",
+  "winningOutcome": 0,
+  "prepared": true,
+  "prepareTx": "0x84139ce88e1f118c220b1427da5f634b654448ec53c9b91a03d35616fb2391ca",
+  "approveTx": "0x410398c110ef877680dacadc5d405e14f38fa67d1796e021fe20f2dd095b0020",
+  "splitTx": "0x4d06d9f5ae15e26b52c9b0c614620782c12fb771242b36d7f04a3c048eae5f3d",
+  "updatedAt": "2026-07-31T04:40:02.780Z",
+  "funding": {
+    "testOnly": true,
+    "usdce": "0x9c4E1703476E875070EE25b56A58B008CFb8FA78",
+    "pUSD": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+    "onramp": "0x93070a847efEf7F70739046A929D47a521F5B8ee",
+    "mintTx": "0xafd56e6619964efa469621a2493177cfb8e1097d54c4565e6700485b4c1465f4",
+    "approveTx": "0xb94cb3231cf4aeb85c9bda933f9c2188f9469338064f2e92d491ca6a38f5eb40",
+    "buyerWrapTx": "0x0e69c39a1b8aaab5e5ccd5b06d7fbaed68a77f315408ad39b5d0bbb662149a0b",
+    "sellerWrapTx": "0x9d2103eb46c067519e66f4fb9758ae3df226336289d221da842926781fb796ba",
+    "buyerAmount": "10",
+    "sellerAmount": "10"
+  }
+}

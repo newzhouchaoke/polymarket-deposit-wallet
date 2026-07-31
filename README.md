@@ -3,7 +3,8 @@
 这是一个只面向 Polygon Amoy 测试网和本地测试的研究项目。项目分成两层：
 
 - `official/`：固定到明确 commit 的 Polymarket 官方公开源码，不修改源码，保留原许可证、编译器、优化参数和汇编实现。
-- `contracts/ResearchPolymarketLike.sol`：便于阅读、修改、数据库和前端演示的研究实现。
+- `contracts/research/`：便于阅读、修改、数据库和前端演示的研究实现。
+- `official/` 与 `contracts/research/` 相互隔离；官方子模块不会被研究编译脚本改写。
 
 交易架构：
 
@@ -32,7 +33,8 @@ Polymarket 官方部署或审计结论。
 
 ## 当前合约架构
 
-所有研究合约位于 `contracts/ResearchPolymarketLike.sol`。
+所有自定义研究合约位于
+`contracts/research/ResearchPolymarketLike.sol`，与 `official/` 下固定版本的官方源码分开。
 
 | 合约 | 作用 |
 | --- | --- |
@@ -166,6 +168,20 @@ npm run official:uma:deploy:amoy
 `OFFICIAL_V2_VARIANT` 支持 `standard`、`neg-risk` 或 `all`。部署脚本在 RPC 不是
 Amoy、依赖没有合约代码或余额小于“估算上限 + 20% 缓冲”时直接终止。
 
+当不同 RPC 返回明显偏高的 EIP-1559 建议费用时，可以先用只读模式测试一个明确的
+Amoy fee cap：
+
+```bash
+AMOY_MAX_FEE_GWEI=30.5 \
+AMOY_PRIORITY_FEE_GWEI=30 \
+OFFICIAL_V2_VARIANT=all \
+npm run official:check:amoy
+```
+
+只有当输出中的 `sufficientBalance` 为 `true`，并且当前网络建议费没有超过 cap 时才应
+广播。cap 太低不会节省已成交交易的 gas 数量，只会限制每单位 gas 的最高价格，并可能
+让交易长时间 pending。
+
 ## Amoy 部署和模拟
 
 在项目 `.env` 或上级 `.env` 配置测试私钥和 RPC。然后运行：
@@ -186,9 +202,69 @@ deployments/research-v2-amoy.json
 
 ## 数据库、API 和后台服务
 
+后端支持两套运行模式：
+
+- `EXCHANGE_MODE=research`：读取研究版合约、ABI 和
+  `data/research-polymarket.sqlite`。
+- `EXCHANGE_MODE=official-v2`：读取
+  `deployments/official-v2-amoy.json`、官方 Forge artifact 和
+  `data/official-v2-polymarket.sqlite`。
+
+两套模式的数据库、撮合状态和链上同步状态相互隔离，不会把研究版订单或事件混入官方
+V2 页面。当前 Amoy 标准官方 V2 部署记录为：
+
+```text
+Exchange: 0xf5d3fb02D8D529190d117aA8BD85A930f8CaB5BB
+Deploy tx: 0x77429ed98250e5d914417fcd562476b8d2de9abf0b433cbd7d42780c1adb9dda
+```
+
+官方模式先配置 `.env`：
+
+```dotenv
+EXCHANGE_MODE=official-v2
+OFFICIAL_V2_RUNTIME_VARIANT=standard
+OFFICIAL_BUYER_WALLET=0x...
+OFFICIAL_SELLER_WALLET=0x...
+# 0=EOA, 1=官方 Proxy, 2=官方 Safe, 3=ERC-1271
+OFFICIAL_BUYER_SIGNATURE_TYPE=1
+OFFICIAL_SELLER_SIGNATURE_TYPE=0
+```
+
+准备标准二元 CTF 市场：
+
+```bash
+npm run official:market:check
+
+LIVE_ACTION=PREPARE_OFFICIAL_MARKET \
+LIVE_CONFIRMATION=AMOY_TESTNET_ONLY \
+npm run official:market:prepare
+```
+
+`official:market:prepare` 把市场参数写入
+`deployments/official-market-amoy.json`。账户持有测试抵押币后，可使用
+`official:market:split` 经官方 OutcomeTokenFactory 拆分 YES/NO 份额。
+Neg Risk 不使用此标准市场脚本。
+
+官方 Amoy 的测试 USDC.e 支持测试铸造。下面的命令只在 chainId 80002 执行，通过官方
+CollateralOnramp 为买方/卖方包装 pUSD：
+
+```bash
+LIVE_ACTION=FUND_OFFICIAL_V2 \
+LIVE_CONFIRMATION=AMOY_TESTNET_ONLY \
+npm run official:fund:amoy
+
+LIVE_ACTION=PREPARE_OFFICIAL_MARKET \
+LIVE_CONFIRMATION=AMOY_TESTNET_ONLY \
+npm run official:market:split
+```
+
+不要把该测试铸造流程用于 Polygon 主网；脚本会拒绝非 Amoy 网络。
+
+然后初始化当前模式的数据库：
+
 ```bash
 npm run db:init
-npm run db:import:research
+npm run db:import
 npm run db:sync:events
 npm run db:sync:balances
 npm run api:restart
@@ -204,10 +280,23 @@ http://127.0.0.1:8787/trade
 自动撮合：
 
 ```bash
+npm run orders:seed:signed
 npm run matcher:dry-run
 npm run matcher:once
 npm run matcher
 ```
+
+官方模式的 dry-run 会调用所部署 Exchange 的 `validateOrder`，直接在链上校验订单哈希和
+签名。只有钱包已持有对应 pUSD/结果份额并完成授权时，才应启动 live matcher：
+
+```bash
+LIVE_ACTION=APPROVE_CURRENT_EXCHANGE \
+LIVE_CONFIRMATION=AMOY_TESTNET_ONLY \
+npm run exchange:approve
+```
+
+授权脚本支持 EOA、官方 Proxy Factory 和研究 ERC-1271 `executeBatch`。官方 Safe 必须通过
+Safe 交易或专用 Amoy Relayer 执行，脚本会拒绝把 Safe 当作普通钱包调用。
 
 持续同步：
 
@@ -216,7 +305,8 @@ npm run chain-sync:once
 npm run chain-sync
 ```
 
-SQLite 文件位于 `data/research-polymarket.sqlite`，保存合约、钱包、市场、链下订单、链上成交、余额和事件。
+SQLite 文件按运行模式分别位于 `data/research-polymarket.sqlite` 与
+`data/official-v2-polymarket.sqlite`，保存合约、钱包、市场、链下订单、链上成交、余额和事件。
 
 ## 安全边界
 
