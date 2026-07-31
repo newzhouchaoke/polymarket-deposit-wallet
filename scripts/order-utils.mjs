@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import dotenv from "dotenv";
-import { getAddress } from "viem";
+import { getAddress, hashTypedData } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { dbPath, initSchema, openDatabase, projectDir, upsert } from "./db.js";
 import { CANCEL_TYPES, ORDER_TYPES } from "./erc7739.mjs";
@@ -112,11 +112,33 @@ export function domainFor(deployment) {
   };
 }
 
+export function orderHashFor(deployment, order) {
+  return hashTypedData({
+    domain: domainFor(deployment),
+    types: ORDER_TYPES,
+    primaryType: "Order",
+    message: {
+      salt: BigInt(order.salt),
+      maker: getAddress(order.maker),
+      signer: getAddress(order.signer),
+      tokenId: BigInt(order.tokenId),
+      makerAmount: BigInt(order.makerAmount),
+      takerAmount: BigInt(order.takerAmount),
+      side: Number(order.side),
+      signatureType: Number(order.signatureType),
+      timestamp: BigInt(order.timestamp),
+      metadata: order.metadata,
+      builder: order.builder,
+    },
+  });
+}
+
 export function insertDbOrder(db, deployment, localOrderId, order, signature, status = "OPEN") {
   if (!deployment.market) {
     throw new Error(`${deployment.mode} 尚未配置市场，无法保存订单`);
   }
   const now = new Date().toISOString();
+  const orderHash = orderHashFor(deployment, order);
   const rawJson = JSON.stringify(
     {
       maker: order.maker,
@@ -132,6 +154,7 @@ export function insertDbOrder(db, deployment, localOrderId, order, signature, st
       expiration: String(order.expiration ?? 0),
       salt: order.salt.toString(),
       signature,
+      orderHash,
     },
   );
   upsert(
@@ -139,12 +162,12 @@ export function insertDbOrder(db, deployment, localOrderId, order, signature, st
     `INSERT INTO orders(
        chain_id, local_order_id, market_id, maker, signer, side, token_id,
        maker_amount, taker_amount, filled_maker_amount, filled_taker_amount,
-       price_micros, status, expiration, salt, signature, raw_json, updated_at
+       price_micros, status, expiration, salt, signature, order_hash, raw_json, updated_at
      )
      VALUES(
        :chainId, :localOrderId, :marketId, :maker, :signer, :side, :tokenId,
        :makerAmount, :takerAmount, '0', '0',
-       :priceMicros, :status, :expiration, :salt, :signature, :rawJson, :updatedAt
+       :priceMicros, :status, :expiration, :salt, :signature, :orderHash, :rawJson, :updatedAt
      )
      ON CONFLICT(chain_id, local_order_id) DO UPDATE SET
        market_id=excluded.market_id,
@@ -161,6 +184,7 @@ export function insertDbOrder(db, deployment, localOrderId, order, signature, st
        expiration=excluded.expiration,
        salt=excluded.salt,
        signature=excluded.signature,
+       order_hash=excluded.order_hash,
        raw_json=excluded.raw_json,
        updated_at=excluded.updated_at`,
     {
@@ -178,6 +202,7 @@ export function insertDbOrder(db, deployment, localOrderId, order, signature, st
       expiration: Number(order.expiration ?? 0),
       salt: order.salt.toString(),
       signature,
+      orderHash,
       rawJson,
       updatedAt: now,
     },

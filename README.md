@@ -286,6 +286,17 @@ npm run matcher:once
 npm run matcher
 ```
 
+撮合器支持一个 BUY taker 对最多 5 个 SELL maker 的价格优先、时间优先撮合。可通过
+`MATCHER_MAX_MAKERS` 调整单笔交易的 maker 上限（1–50）。每次链上
+`OrderFilled` 都按 `tx_hash + log_index` 保存到 `order_fills`，同步器再使用
+`getOrderStatus(orderHash)` 对账本地的部分成交和完全成交状态：
+
+```bash
+npm run test:matcher
+npm run db:sync:events
+curl http://127.0.0.1:8787/api/order-fills
+```
+
 官方模式的 dry-run 会调用所部署 Exchange 的 `validateOrder`，直接在链上校验订单哈希和
 签名。只有钱包已持有对应 pUSD/结果份额并完成授权时，才应启动 live matcher：
 
@@ -297,6 +308,41 @@ npm run exchange:approve
 
 授权脚本支持 EOA、官方 Proxy Factory 和研究 ERC-1271 `executeBatch`。官方 Safe 必须通过
 Safe 交易或专用 Amoy Relayer 执行，脚本会拒绝把 Safe 当作普通钱包调用。
+
+### 市场关闭、结算与赎回
+
+```bash
+# 只读，不广播
+npm run official:market:status
+
+# 只关闭本地订单簿，不发链上交易
+npm run official:market:close
+
+# 以下命令会在 Amoy 广播不可逆测试交易
+npm run official:market:resolve:yes
+# 或 npm run official:market:resolve:no
+
+npm run official:market:redeem:buyer
+npm run official:market:redeem:seller
+```
+
+标准 CTF Exchange 本身不保存“市场开放/关闭”元数据，所以 `close` 是后端订单簿状态。
+`resolve` 由配置的 oracle 调用 Conditional Tokens 的 `reportPayouts`；`redeem` 通过
+`CtfCollateralAdapter.redeemPositions` 把胜出 ERC-1155 头寸换回 pUSD。交易页面也提供
+相同操作，并在结算前显示不可逆确认。
+
+### 官方 V2 订单取消边界
+
+当前固定的官方 V2 没有“用户按订单哈希取消任意签名订单”的入口。项目区分：
+
+- 本地取消：立即从本订单簿移除，但不能让已经泄露到其他撮合器的有效签名失效。
+- `preapproveOrder` / `invalidatePreapprovedOrder`：只允许 Exchange operator 调用；
+  后者只撤销 operator 预批准，原始用户签名仍可能有效。
+- 用户级 `pauseUser` 会影响该 maker 的全部订单，不等于单订单取消。当前官方源码默认在
+  100 个区块后链上生效；本地撮合器在提交暂停交易后立即停止使用这些订单。
+
+交易页面的“链上预批准/使预批准失效”按上述边界实现，不把预批准失效错误描述成通用
+链上取消。
 
 持续同步：
 

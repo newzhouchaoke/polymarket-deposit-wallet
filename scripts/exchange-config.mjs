@@ -159,6 +159,11 @@ function officialMarket() {
   return {
     marketId,
     conditionId,
+    questionId: envValue("OFFICIAL_QUESTION_ID") ?? fileMarket.questionId,
+    oracle: optionalAddress(
+      envValue("OFFICIAL_MARKET_ORACLE") ?? fileMarket.oracle,
+      "OFFICIAL_MARKET_ORACLE",
+    ),
     yesTokenId: String(yesTokenId),
     noTokenId: String(noTokenId),
     question:
@@ -168,6 +173,11 @@ function officialMarket() {
     closeTime: Number(fileMarket.closeTime ?? 0),
     status: String(fileMarket.status ?? "OPEN").toUpperCase(),
     winningOutcome: Number(fileMarket.winningOutcome ?? 0),
+    prepared: Boolean(fileMarket.prepared),
+    prepareTx: fileMarket.prepareTx ?? null,
+    closeTx: fileMarket.closeTx ?? null,
+    resolveTx: fileMarket.resolveTx ?? null,
+    payoutDenominator: String(fileMarket.payoutDenominator ?? "0"),
   };
 }
 
@@ -296,6 +306,9 @@ export function runtimeSummary(config = loadExchangeConfig()) {
     collateralSymbol: config.collateralSymbol,
     marketConfigured: Boolean(config.market),
     marketId: config.market?.marketId ?? null,
+    conditionId: config.market?.conditionId ?? null,
+    outcomeTokenFactory:
+      config.officialDependencies?.outcomeTokenFactory ?? null,
     deploymentPath: config.deploymentPath,
   };
 }

@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { dbMode, dbPath, initSchema, openDatabase, projectDir } from "./db.js";
 import { readMatcherStatus } from "./matcher-core.mjs";
+import { orderHashFor, sideNumber } from "./order-utils.mjs";
 import {
   loadExchangeConfig,
   runtimeSummary,
@@ -21,7 +22,8 @@ const host = process.env.API_HOST ?? "127.0.0.1";
 const port = Number(process.env.API_PORT ?? "8787");
 const db = openDatabase();
 initSchema(db);
-const exchangeRuntime = runtimeSummary(loadExchangeConfig());
+const exchangeConfig = loadExchangeConfig();
+const exchangeRuntime = runtimeSummary(exchangeConfig);
 
 function rows(sql, params = {}) {
   return db.prepare(sql).all(params).map(parseJsonColumns);
@@ -229,17 +231,32 @@ function insertOrder(order) {
     normalized.filledMakerAmount,
     normalized.filledTakerAmount,
   );
+  const contractOrder = {
+    salt: BigInt(normalized.salt),
+    maker: normalized.maker,
+    signer: normalized.signer,
+    tokenId: BigInt(normalized.tokenId),
+    makerAmount: BigInt(normalized.makerAmount),
+    takerAmount: BigInt(normalized.takerAmount),
+    side: sideNumber(normalized.side),
+    signatureType: normalized.signatureType,
+    timestamp: BigInt(normalized.timestamp),
+    metadata: normalized.metadata,
+    builder: normalized.builder,
+  };
+  const orderHash = orderHashFor(exchangeConfig, contractOrder);
+  normalized.orderHash = orderHash;
 
   db.prepare(
     `INSERT INTO orders(
        chain_id, local_order_id, market_id, maker, signer, side, token_id,
        maker_amount, taker_amount, filled_maker_amount, filled_taker_amount,
-       price_micros, status, expiration, salt, signature, raw_json, updated_at
+       price_micros, status, expiration, salt, signature, order_hash, raw_json, updated_at
      )
      VALUES(
        :chainId, :localOrderId, :marketId, :maker, :signer, :side, :tokenId,
        :makerAmount, :takerAmount, :filledMakerAmount, :filledTakerAmount,
-       :priceMicros, :status, :expiration, :salt, :signature, :rawJson, CURRENT_TIMESTAMP
+       :priceMicros, :status, :expiration, :salt, :signature, :orderHash, :rawJson, CURRENT_TIMESTAMP
      )
      ON CONFLICT(chain_id, local_order_id) DO UPDATE SET
        market_id=excluded.market_id,
@@ -256,6 +273,7 @@ function insertOrder(order) {
        expiration=excluded.expiration,
        salt=excluded.salt,
        signature=excluded.signature,
+       order_hash=excluded.order_hash,
        raw_json=excluded.raw_json,
        updated_at=excluded.updated_at`,
   ).run({
@@ -275,6 +293,7 @@ function insertOrder(order) {
     expiration: normalized.expiration,
     salt: normalized.salt,
     signature: normalized.signature,
+    orderHash,
     rawJson: JSON.stringify(normalized),
   });
 
@@ -385,6 +404,104 @@ async function cancelOrderOnchain(localOrderId, body = {}) {
   };
 }
 
+async function manageOfficialOrder(localOrderId, action, body = {}) {
+  if (exchangeRuntime.mode !== "official-v2") {
+    throw new Error("预批准管理只适用于 official-v2");
+  }
+  if (body.confirmation !== "AMOY_TESTNET_ONLY") {
+    throw new Error("链上预批准管理需要 confirmation=AMOY_TESTNET_ONLY");
+  }
+  const result = await runCommand(
+    "node",
+    ["scripts/manage-official-order.mjs", action, localOrderId],
+    {
+      cwd: new URL("..", import.meta.url).pathname,
+      env: {
+        ...process.env,
+        LIVE_ACTION: "MANAGE_OFFICIAL_ORDER",
+        LIVE_CONFIRMATION: "AMOY_TESTNET_ONLY",
+      },
+    },
+  );
+  return {
+    order: orderById(localOrderId),
+    stdout: result.stdout.trim(),
+    stderr: result.stderr.trim(),
+  };
+}
+
+async function manageOfficialUser(role, action, body = {}) {
+  if (exchangeRuntime.mode !== "official-v2") {
+    throw new Error("用户暂停只适用于 official-v2");
+  }
+  if (body.confirmation !== "AMOY_TESTNET_ONLY") {
+    throw new Error("用户暂停管理需要 confirmation=AMOY_TESTNET_ONLY");
+  }
+  const normalizedRole = String(role).toUpperCase();
+  if (!["BUYER", "SELLER"].includes(normalizedRole)) {
+    throw new Error("role 必须是 BUYER 或 SELLER");
+  }
+  const result = await runCommand(
+    "node",
+    ["scripts/manage-official-user.mjs", action, normalizedRole],
+    {
+      cwd: new URL("..", import.meta.url).pathname,
+      env: {
+        ...process.env,
+        LIVE_ACTION: "MANAGE_OFFICIAL_USER",
+        LIVE_CONFIRMATION: "AMOY_TESTNET_ONLY",
+      },
+    },
+  );
+  return {
+    role: normalizedRole,
+    action,
+    stdout: result.stdout.trim(),
+    stderr: result.stderr.trim(),
+  };
+}
+
+async function runMarketLifecycle(marketId, action, body = {}) {
+  if (exchangeRuntime.mode !== "official-v2") {
+    throw new Error("官方市场生命周期接口只适用于 official-v2");
+  }
+  if (marketId !== exchangeRuntime.marketId) {
+    throw new Error(`当前运行时未配置该市场：${marketId}`);
+  }
+  const args = ["scripts/official-market-lifecycle.mjs", action];
+  const env = { ...process.env };
+  if (action === "resolve") {
+    if (body.confirmation !== "AMOY_TESTNET_ONLY") {
+      throw new Error("链上结算需要 confirmation=AMOY_TESTNET_ONLY");
+    }
+    const outcome = String(body.outcome ?? "").toUpperCase();
+    if (!["YES", "NO"].includes(outcome)) throw new Error("outcome 必须是 YES 或 NO");
+    args.push(outcome);
+    env.LIVE_ACTION = "RESOLVE_OFFICIAL_MARKET";
+    env.LIVE_CONFIRMATION = "AMOY_TESTNET_ONLY";
+  } else if (action === "redeem") {
+    if (body.confirmation !== "AMOY_TESTNET_ONLY") {
+      throw new Error("链上赎回需要 confirmation=AMOY_TESTNET_ONLY");
+    }
+    const role = String(body.role ?? "").toUpperCase();
+    if (!["BUYER", "SELLER"].includes(role)) {
+      throw new Error("role 必须是 BUYER 或 SELLER");
+    }
+    args.push(role);
+    env.LIVE_ACTION = "REDEEM_OFFICIAL_MARKET";
+    env.LIVE_CONFIRMATION = "AMOY_TESTNET_ONLY";
+  }
+  const result = await runCommand("node", args, {
+    cwd: new URL("..", import.meta.url).pathname,
+    env,
+  });
+  return {
+    market: one("SELECT * FROM markets WHERE market_id = :marketId", { marketId }),
+    stdout: result.stdout.trim(),
+    stderr: result.stderr.trim(),
+  };
+}
+
 async function seedSignedOrders() {
   const result = await runCommand("node", ["scripts/seed-signed-orders.mjs"], {
     cwd: new URL("..", import.meta.url).pathname,
@@ -470,6 +587,7 @@ function indexPage() {
     ["/api/markets/:id/orderbook", "指定市场订单簿"],
     ["/api/orderbook", "订单簿"],
     ["/api/trades", "成交"],
+    ["/api/order-fills", "逐订单链上成交"],
     ["/api/balances", "余额"],
     ["/api/events", "链上事件"],
     ["/api/matcher/status", "自动撮合状态"],
@@ -619,6 +737,18 @@ function tradePage() {
         <label>Market</label>
         <select id="market-select">${marketOptions}</select>
         <div class="status" id="market-info">加载市场信息...</div>
+        ${
+          officialRuntime
+            ? `<div class="topline">
+                <button id="market-close" type="button" class="secondary">关闭本地订单簿</button>
+                <button id="market-resolve-yes" type="button" class="warn">结算 YES</button>
+                <button id="market-resolve-no" type="button" class="warn">结算 NO</button>
+                <button id="market-redeem-buyer" type="button">买方赎回</button>
+                <button id="market-redeem-seller" type="button">卖方赎回</button>
+              </div>
+              <p class="muted small">关闭仅更新本地订单簿；结算调用 CTF reportPayouts，且不可逆。赎回调用 CtfCollateralAdapter。</p>`
+            : ""
+        }
         <div class="topline">
           <label><input id="auto-refresh" type="checkbox" checked style="width:auto" /> 自动刷新 5 秒</label>
         </div>
@@ -636,6 +766,25 @@ function tradePage() {
         <button id="sync-db" type="button" class="secondary">同步事件/余额</button>
         <div id="action-status" class="status">等待操作</div>
       </div>
+
+      ${
+        officialRuntime
+          ? `<div class="card">
+              <h2>官方 V2 Operator 预批准</h2>
+              <label>local_order_id</label>
+              <input id="preapproval-id" placeholder="点击订单行可自动填入" />
+              <button id="preapprove-order" type="button">链上预批准</button>
+              <button id="invalidate-order" type="button" class="warn">使预批准失效</button>
+              <p class="muted small">失效只撤销 Operator 的预批准，不会使原始用户签名失效；系统会同时本地取消该订单。</p>
+              <h3>用户级全部订单暂停</h3>
+              <button id="pause-buyer" type="button" class="warn">暂停 BUYER</button>
+              <button id="unpause-buyer" type="button">恢复 BUYER</button>
+              <button id="pause-seller" type="button" class="warn">暂停 SELLER</button>
+              <button id="unpause-seller" type="button">恢复 SELLER</button>
+              <p class="muted small">pauseUser 会阻止该 maker 的全部订单；不是单订单取消。</p>
+            </div>`
+          : ""
+      }
 
       <div class="card">
         <h2>提交订单到数据库</h2>
@@ -831,14 +980,17 @@ function tradePage() {
     async function refresh() {
       const market = activeMarket();
       const marketId = encodeURIComponent(market.market_id || "");
-      const [book, orders, trades, balances, matcher, chainSync] = await Promise.all([
+      const [book, orders, trades, balances, matcher, chainSync, latestMarkets] = await Promise.all([
         fetch("/api/orderbook?marketId=" + marketId).then((r) => r.json()),
         fetch("/api/orders?marketId=" + marketId + "&limit=30").then((r) => r.json()),
         fetch("/api/trades?marketId=" + marketId + "&limit=20").then((r) => r.json()),
         fetch("/api/balances").then((r) => r.json()),
         fetch("/api/matcher/status").then((r) => r.json()),
         fetch("/api/chain-sync/status").then((r) => r.json()),
+        fetch("/api/markets").then((r) => r.json()),
       ]);
+      const latestMarket = latestMarkets.find((item) => item.market_id === market.market_id);
+      if (latestMarket) Object.assign(market, latestMarket);
       document.querySelector("#metric-market").textContent = shortText(market.market_id || "无市场", 8);
       document.querySelector("#metric-matcher").textContent = matcher.running ? "运行中" : "未运行";
       document.querySelector("#metric-chain-sync").textContent = chainSync.running ? "运行中" : "未运行";
@@ -902,6 +1054,70 @@ function tradePage() {
     document.querySelector("#sync-db").addEventListener("click", () => {
       runAction("同步事件/余额", () => postJson("/api/sync"));
     });
+    if (runtimeMode === "official-v2") {
+      const marketAction = (action, body, label) => {
+        const market = activeMarket();
+        return runAction(
+          label,
+          () => postJson(
+            "/api/markets/" + encodeURIComponent(market.market_id) + "/" + action,
+            body,
+          ),
+        );
+      };
+      document.querySelector("#market-close").addEventListener("click", () => {
+        if (!confirm("关闭后，本地订单簿将不再接受新订单。确认关闭？")) return;
+        marketAction("close", {}, "关闭市场");
+      });
+      document.querySelector("#market-resolve-yes").addEventListener("click", () => {
+        if (!confirm("不可逆操作：确认在 Amoy 将结果结算为 YES？")) return;
+        marketAction("resolve", { outcome: "YES", confirmation: "AMOY_TESTNET_ONLY" }, "结算 YES");
+      });
+      document.querySelector("#market-resolve-no").addEventListener("click", () => {
+        if (!confirm("不可逆操作：确认在 Amoy 将结果结算为 NO？")) return;
+        marketAction("resolve", { outcome: "NO", confirmation: "AMOY_TESTNET_ONLY" }, "结算 NO");
+      });
+      for (const role of ["buyer", "seller"]) {
+        document.querySelector("#market-redeem-" + role).addEventListener("click", () => {
+          if (!confirm("确认让 " + role.toUpperCase() + " 在 Amoy 赎回胜出头寸？")) return;
+          marketAction(
+            "redeem",
+            { role: role.toUpperCase(), confirmation: "AMOY_TESTNET_ONLY" },
+            role.toUpperCase() + " 赎回",
+          );
+        });
+      }
+      document.querySelector("#preapprove-order").addEventListener("click", () => {
+        const id = document.querySelector("#preapproval-id").value.trim();
+        if (!id) return alert("请输入 local_order_id");
+        if (!confirm("确认由本测试 Exchange Operator 链上预批准该订单？")) return;
+        runAction("链上预批准", () => postJson(
+          "/api/orders/" + encodeURIComponent(id) + "/preapprove-chain",
+          { confirmation: "AMOY_TESTNET_ONLY" },
+        ));
+      });
+      document.querySelector("#invalidate-order").addEventListener("click", () => {
+        const id = document.querySelector("#preapproval-id").value.trim();
+        if (!id) return alert("请输入 local_order_id");
+        if (!confirm("确认撤销该订单的 Operator 预批准，并从本地订单簿取消？")) return;
+        runAction("预批准失效", () => postJson(
+          "/api/orders/" + encodeURIComponent(id) + "/invalidate-chain",
+          { confirmation: "AMOY_TESTNET_ONLY" },
+        ));
+      });
+      for (const role of ["buyer", "seller"]) {
+        for (const action of ["pause", "unpause"]) {
+          document.querySelector("#" + action + "-" + role).addEventListener("click", () => {
+            const verb = action === "pause" ? "暂停" : "恢复";
+            if (!confirm("确认在 Amoy " + verb + " " + role.toUpperCase() + " 的全部订单？")) return;
+            runAction(verb + " " + role.toUpperCase(), () => postJson(
+              "/api/users/" + role + "/" + action,
+              { confirmation: "AMOY_TESTNET_ONLY" },
+            ));
+          });
+        }
+      }
+    }
     document.querySelector("#cancel-order").addEventListener("click", () => {
       const id = document.querySelector("#cancel-id").value.trim();
       if (!id) return alert("请输入 local_order_id");
@@ -925,6 +1141,8 @@ function tradePage() {
       const target = event.target;
       if (!target?.dataset?.id) return;
       document.querySelector("#cancel-id").value = target.dataset.id;
+      const preapprovalId = document.querySelector("#preapproval-id");
+      if (preapprovalId) preapprovalId.value = target.dataset.id;
       if (target.classList.contains("cancel-row")) {
         document.querySelector("#cancel-order").click();
       }
@@ -1186,6 +1404,7 @@ const routes = {
       markets: one("SELECT COUNT(*) AS count FROM markets").count,
       orders: one("SELECT COUNT(*) AS count FROM orders").count,
       trades: one("SELECT COUNT(*) AS count FROM trades").count,
+      orderFills: one("SELECT COUNT(*) AS count FROM order_fills").count,
       tokenBalances: one("SELECT COUNT(*) AS count FROM token_balances").count,
       chainEvents: one("SELECT COUNT(*) AS count FROM chain_events").count,
     },
@@ -1247,6 +1466,27 @@ const routes = {
       params,
     );
   },
+  "/api/order-fills": (url) => {
+    const orderHash = url.searchParams.get("orderHash");
+    const localOrderId = url.searchParams.get("localOrderId");
+    const clauses = [];
+    const params = { limit: limit(url), offset: offset(url) };
+    if (orderHash) {
+      clauses.push("lower(order_hash) = lower(:orderHash)");
+      params.orderHash = orderHash;
+    }
+    if (localOrderId) {
+      clauses.push("local_order_id = :localOrderId");
+      params.localOrderId = localOrderId;
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    return rows(
+      `SELECT * FROM order_fills ${where}
+       ORDER BY block_number DESC, log_index DESC
+       LIMIT :limit OFFSET :offset`,
+      params,
+    );
+  },
   "/api/balances": (url) => {
     const wallet = url.searchParams.get("wallet");
     const symbol = url.searchParams.get("symbol");
@@ -1300,10 +1540,24 @@ function marketOrderbookPath(pathname) {
 }
 
 function orderActionPath(pathname) {
-  const match = pathname.match(/^\/api\/orders\/(.+)\/(cancel|fill|cancel-chain)$/);
+  const match = pathname.match(
+    /^\/api\/orders\/(.+)\/(cancel|fill|cancel-chain|preapprove-chain|invalidate-chain)$/,
+  );
   return match
     ? { localOrderId: decodeURIComponent(match[1]), action: match[2] }
     : null;
+}
+
+function marketActionPath(pathname) {
+  const match = pathname.match(/^\/api\/markets\/(.+)\/(close|resolve|redeem)$/);
+  return match
+    ? { marketId: decodeURIComponent(match[1]), action: match[2] }
+    : null;
+}
+
+function userActionPath(pathname) {
+  const match = pathname.match(/^\/api\/users\/(buyer|seller)\/(pause|unpause)$/i);
+  return match ? { role: match[1], action: match[2].toLowerCase() } : null;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1336,6 +1590,28 @@ const server = http.createServer(async (req, res) => {
         const body = await readJsonBody(req);
         return json(res, 201, insertOrder(body));
       }
+      const marketAction = marketActionPath(url.pathname);
+      if (marketAction) {
+        const body = await readJsonBody(req);
+        return json(
+          res,
+          200,
+          await runMarketLifecycle(
+            marketAction.marketId,
+            marketAction.action,
+            body,
+          ),
+        );
+      }
+      const userAction = userActionPath(url.pathname);
+      if (userAction) {
+        const body = await readJsonBody(req);
+        return json(
+          res,
+          200,
+          await manageOfficialUser(userAction.role, userAction.action, body),
+        );
+      }
       const action = orderActionPath(url.pathname);
       if (action?.action === "cancel") {
         return json(res, 200, cancelOrder(action.localOrderId));
@@ -1347,6 +1623,22 @@ const server = http.createServer(async (req, res) => {
       if (action?.action === "cancel-chain") {
         const body = await readJsonBody(req);
         return json(res, 200, await cancelOrderOnchain(action.localOrderId, body));
+      }
+      if (action?.action === "preapprove-chain") {
+        const body = await readJsonBody(req);
+        return json(
+          res,
+          200,
+          await manageOfficialOrder(action.localOrderId, "preapprove", body),
+        );
+      }
+      if (action?.action === "invalidate-chain") {
+        const body = await readJsonBody(req);
+        return json(
+          res,
+          200,
+          await manageOfficialOrder(action.localOrderId, "invalidate", body),
+        );
       }
       return notFound(res, url.pathname);
     }

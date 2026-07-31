@@ -62,6 +62,12 @@ export function initSchema(db) {
       close_time INTEGER NOT NULL,
       status TEXT NOT NULL DEFAULT 'OPEN',
       winning_outcome INTEGER NOT NULL DEFAULT 0,
+      question_id TEXT,
+      condition_id TEXT,
+      oracle TEXT,
+      close_tx TEXT,
+      resolve_tx TEXT,
+      payout_denominator TEXT NOT NULL DEFAULT '0',
       market_registry TEXT NOT NULL,
       created_tx TEXT,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -85,6 +91,10 @@ export function initSchema(db) {
       expiration INTEGER NOT NULL DEFAULT 0,
       salt TEXT NOT NULL,
       signature TEXT,
+      order_hash TEXT,
+      preapproved INTEGER NOT NULL DEFAULT 0,
+      invalidated INTEGER NOT NULL DEFAULT 0,
+      last_chain_tx TEXT,
       raw_json TEXT NOT NULL,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (chain_id, local_order_id),
@@ -141,6 +151,25 @@ export function initSchema(db) {
       PRIMARY KEY (chain_id, tx_hash)
     );
 
+    CREATE TABLE IF NOT EXISTS order_fills (
+      chain_id INTEGER NOT NULL,
+      tx_hash TEXT NOT NULL,
+      log_index INTEGER NOT NULL,
+      order_hash TEXT NOT NULL,
+      local_order_id TEXT,
+      maker TEXT NOT NULL,
+      taker TEXT NOT NULL,
+      side TEXT NOT NULL,
+      token_id TEXT NOT NULL,
+      maker_amount_filled TEXT NOT NULL,
+      taker_amount_filled TEXT NOT NULL,
+      fee TEXT NOT NULL DEFAULT '0',
+      block_number INTEGER NOT NULL DEFAULT 0,
+      raw_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (chain_id, tx_hash, log_index)
+    );
+
     CREATE TABLE IF NOT EXISTS sync_state (
       chain_id INTEGER NOT NULL,
       name TEXT NOT NULL,
@@ -155,6 +184,8 @@ export function initSchema(db) {
       ON trades(chain_id, market_id);
     CREATE INDEX IF NOT EXISTS idx_chain_events_name
       ON chain_events(chain_id, event_name);
+    CREATE INDEX IF NOT EXISTS idx_order_fills_order_hash
+      ON order_fills(chain_id, order_hash);
   `);
 
   const columns = db.prepare("PRAGMA table_info(chain_events)").all();
@@ -192,6 +223,18 @@ export function initSchema(db) {
   if (!marketColumns.some((column) => column.name === "winning_outcome")) {
     db.exec("ALTER TABLE markets ADD COLUMN winning_outcome INTEGER NOT NULL DEFAULT 0;");
   }
+  for (const [name, definition] of [
+    ["question_id", "TEXT"],
+    ["condition_id", "TEXT"],
+    ["oracle", "TEXT"],
+    ["close_tx", "TEXT"],
+    ["resolve_tx", "TEXT"],
+    ["payout_denominator", "TEXT NOT NULL DEFAULT '0'"],
+  ]) {
+    if (!marketColumns.some((column) => column.name === name)) {
+      db.exec(`ALTER TABLE markets ADD COLUMN ${name} ${definition};`);
+    }
+  }
 
   const orderColumns = db.prepare("PRAGMA table_info(orders)").all();
   if (!orderColumns.some((column) => column.name === "filled_maker_amount")) {
@@ -200,6 +243,22 @@ export function initSchema(db) {
   if (!orderColumns.some((column) => column.name === "filled_taker_amount")) {
     db.exec("ALTER TABLE orders ADD COLUMN filled_taker_amount TEXT NOT NULL DEFAULT '0';");
   }
+  for (const [name, definition] of [
+    ["order_hash", "TEXT"],
+    ["preapproved", "INTEGER NOT NULL DEFAULT 0"],
+    ["invalidated", "INTEGER NOT NULL DEFAULT 0"],
+    ["last_chain_tx", "TEXT"],
+  ]) {
+    if (!orderColumns.some((column) => column.name === name)) {
+      db.exec(`ALTER TABLE orders ADD COLUMN ${name} ${definition};`);
+    }
+  }
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_orders_order_hash
+      ON orders(chain_id, order_hash);
+    CREATE INDEX IF NOT EXISTS idx_order_fills_order_hash
+      ON order_fills(chain_id, order_hash);
+  `);
 }
 
 export function upsert(db, sql, params) {

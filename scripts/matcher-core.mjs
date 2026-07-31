@@ -71,7 +71,7 @@ export function readMatcherStatus() {
   return JSON.parse(fs.readFileSync(matcherStatusPath, "utf8"));
 }
 
-export function bestPair(db) {
+export function bestMatch(db, maxMakers = Number(process.env.MATCHER_MAX_MAKERS ?? "5")) {
   const buys = db.prepare(
     `SELECT *
      FROM orders
@@ -99,31 +99,59 @@ export function bestPair(db) {
        AND token_id = :tokenId
        AND price_micros <= :buyPriceMicros
      ORDER BY price_micros ASC, updated_at ASC
-     LIMIT 1`,
+     LIMIT :limit`,
   );
 
   for (const buy of buys) {
-    const sell = sellStatement.get({
+    const candidates = sellStatement.all({
       marketId: buy.market_id,
       tokenId: buy.token_id,
       buyPriceMicros: buy.price_micros,
+      limit: Math.max(1, Math.min(50, Number(maxMakers) || 5)),
     });
-    if (!sell) continue;
+    if (!candidates.length) continue;
 
-    if (
-      BigInt(buy.maker_amount) * BigInt(sell.maker_amount) <
-      BigInt(sell.taker_amount) * BigInt(buy.taker_amount)
-    ) {
-      continue;
+    let remainingBuyOutcome = remainingOutcome(buy);
+    let remainingBuyCollateral =
+      BigInt(buy.maker_amount) - BigInt(buy.filled_maker_amount ?? "0");
+    const makers = [];
+    for (const sell of candidates) {
+      if (
+        BigInt(buy.maker_amount) * BigInt(sell.maker_amount) <
+        BigInt(sell.taker_amount) * BigInt(buy.taker_amount)
+      ) {
+        continue;
+      }
+      let outcomeAmount =
+        remainingBuyOutcome < remainingOutcome(sell)
+          ? remainingBuyOutcome
+          : remainingOutcome(sell);
+      let collateralAmount = collateralForOutcome(sell, outcomeAmount);
+      if (collateralAmount > remainingBuyCollateral) {
+        outcomeAmount =
+          (remainingBuyCollateral * BigInt(sell.maker_amount)) /
+          BigInt(sell.taker_amount);
+        collateralAmount = collateralForOutcome(sell, outcomeAmount);
+      }
+      if (outcomeAmount <= 0n || collateralAmount <= 0n) continue;
+      makers.push({ sell, outcomeAmount, collateralAmount });
+      remainingBuyOutcome -= outcomeAmount;
+      remainingBuyCollateral -= collateralAmount;
+      if (remainingBuyOutcome === 0n || remainingBuyCollateral === 0n) break;
     }
-
-    return { buy, sell };
+    if (makers.length) return { buy, makers };
   }
 
   return {
     reason: "没有价格交叉且支付上限足够的 BUY/SELL 订单",
     bestBuy: buys[0],
   };
+}
+
+export function bestPair(db) {
+  const match = bestMatch(db, 1);
+  if (match.reason) return match;
+  return { buy: match.buy, sell: match.makers[0].sell };
 }
 
 export function remainingOutcome(row) {
@@ -170,28 +198,38 @@ export async function matchOnce(options = {}) {
   const deployment = loadDeployment({ requireMarket: true });
   const db = openResearchDb();
   try {
-    const pair = bestPair(db);
-    if (pair.reason) {
+    const match = bestMatch(db);
+    if (match.reason) {
       return {
         matched: false,
-        reason: pair.reason,
-        bestBuy: pair.bestBuy?.local_order_id,
+        reason: match.reason,
+        bestBuy: match.bestBuy?.local_order_id,
       };
     }
 
-    const outcomeAmount = remainingOutcome(pair.buy) < remainingOutcome(pair.sell)
-      ? remainingOutcome(pair.buy)
-      : remainingOutcome(pair.sell);
-    const collateralAmount = collateralForOutcome(pair.sell, outcomeAmount);
+    const outcomeAmount = match.makers.reduce(
+      (total, maker) => total + maker.outcomeAmount,
+      0n,
+    );
+    const collateralAmount = match.makers.reduce(
+      (total, maker) => total + maker.collateralAmount,
+      0n,
+    );
     const summary = {
-      buyOrderId: pair.buy.local_order_id,
-      sellOrderId: pair.sell.local_order_id,
-      buyPriceMicros: pair.buy.price_micros,
-      sellPriceMicros: pair.sell.price_micros,
-      marketId: pair.buy.market_id,
-      tokenId: pair.buy.token_id,
+      buyOrderId: match.buy.local_order_id,
+      sellOrderIds: match.makers.map(({ sell }) => sell.local_order_id),
+      makerCount: match.makers.length,
+      buyPriceMicros: match.buy.price_micros,
+      sellPriceMicros: match.makers.map(({ sell }) => sell.price_micros),
+      marketId: match.buy.market_id,
+      tokenId: match.buy.token_id,
       outcomeAmount: outcomeAmount.toString(),
       collateralAmount: collateralAmount.toString(),
+      makerFills: match.makers.map(({ sell, outcomeAmount: outcome, collateralAmount: collateral }) => ({
+        sellOrderId: sell.local_order_id,
+        outcomeAmount: outcome.toString(),
+        collateralAmount: collateral.toString(),
+      })),
     };
 
     if (dryRun) {
@@ -202,8 +240,8 @@ export async function matchOnce(options = {}) {
       const exchangeArtifact = readCurrentExchangeArtifact(deployment);
       const validation = {};
       for (const [side, row] of [
-        ["buy", pair.buy],
-        ["sell", pair.sell],
+        ["buy", match.buy],
+        ...match.makers.map(({ sell }, index) => [`sell-${index + 1}`, sell]),
       ]) {
         try {
           await publicClient.readContract({
@@ -229,12 +267,12 @@ export async function matchOnce(options = {}) {
           functionName: "matchOrders",
           args: [
             deployment.market.conditionId ?? deployment.market.marketId,
-            toContractOrder(pair.buy),
-            [toContractOrder(pair.sell)],
+            toContractOrder(match.buy),
+            match.makers.map(({ sell }) => toContractOrder(sell)),
             collateralAmount,
-            [outcomeAmount],
+            match.makers.map(({ outcomeAmount: amount }) => amount),
             0n,
-            [0n],
+            match.makers.map(() => 0n),
           ],
         });
         settlementSimulation = { ready: true };
@@ -267,16 +305,16 @@ export async function matchOnce(options = {}) {
     });
     const exchangeArtifact = readCurrentExchangeArtifact(deployment);
 
-    const buyOrder = toContractOrder(pair.buy);
-    const sellOrder = toContractOrder(pair.sell);
+    const buyOrder = toContractOrder(match.buy);
+    const sellOrders = match.makers.map(({ sell }) => toContractOrder(sell));
     const matchArgs = [
       deployment.market.conditionId ?? deployment.market.marketId,
       buyOrder,
-      [sellOrder],
+      sellOrders,
       collateralAmount,
-      [outcomeAmount],
+      match.makers.map(({ outcomeAmount: amount }) => amount),
       0n,
-      [0n],
+      match.makers.map(() => 0n),
     ];
     const { request } = await publicClient.simulateContract({
       account: signer,
@@ -289,8 +327,11 @@ export async function matchOnce(options = {}) {
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
     if (receipt.status !== "success") throw new Error(`撮合交易失败：${hash}`);
 
-    const buyFill = updateFill(db, pair.buy, collateralAmount, outcomeAmount);
-    const sellFill = updateFill(db, pair.sell, outcomeAmount, collateralAmount);
+    const buyFill = updateFill(db, match.buy, collateralAmount, outcomeAmount);
+    const sellFills = match.makers.map(({ sell, outcomeAmount: outcome, collateralAmount: collateral }) => ({
+      localOrderId: sell.local_order_id,
+      ...updateFill(db, sell, outcome, collateral),
+    }));
     upsert(
       db,
       `INSERT INTO trades(
@@ -314,14 +355,14 @@ export async function matchOnce(options = {}) {
       {
         chainId: Number(deployment.chainId),
         txHash: hash,
-        marketId: pair.buy.market_id,
-        buyer: pair.buy.maker,
-        seller: pair.sell.maker,
-        tokenId: pair.buy.token_id,
+        marketId: match.buy.market_id,
+        buyer: match.buy.maker,
+        seller: match.makers[0].sell.maker,
+        tokenId: match.buy.token_id,
         outcomeAmount: outcomeAmount.toString(),
         collateralAmount: collateralAmount.toString(),
-        buyOrderId: pair.buy.local_order_id,
-        sellOrderId: pair.sell.local_order_id,
+        buyOrderId: match.buy.local_order_id,
+        sellOrderId: match.makers[0].sell.local_order_id,
         rawJson: JSON.stringify({
           source: "matcher-core",
           ...summary,
@@ -338,7 +379,7 @@ export async function matchOnce(options = {}) {
       explorer: `https://amoy.polygonscan.com/tx/${hash}`,
       ...summary,
       buyFill,
-      sellFill,
+      sellFills,
     };
   } finally {
     db.close();

@@ -16,6 +16,10 @@ import {
   loadExchangeConfig,
   readExchangeArtifact,
 } from "./exchange-config.mjs";
+import {
+  orderHashFor,
+  toContractOrder,
+} from "./order-utils.mjs";
 
 dotenv.config({ path: path.join(projectDir, "..", ".env"), quiet: true });
 dotenv.config({ path: path.join(projectDir, ".env"), override: true, quiet: true });
@@ -74,6 +78,21 @@ const db = openDatabase();
 initSchema(db);
 
 const exchangeAbi = readExchangeArtifact(deployment).abi;
+const conditionalTokensAbi =
+  deployment.mode === OFFICIAL_MODE
+    ? JSON.parse(
+        fs.readFileSync(
+          path.join(
+            projectDir,
+            "official",
+            "ctf-exchange-v2",
+            "artifacts",
+            "ConditionalTokens.json",
+          ),
+          "utf8",
+        ),
+      ).abi
+    : null;
 const addressConfigs =
   deployment.mode === OFFICIAL_MODE
     ? [
@@ -81,6 +100,11 @@ const addressConfigs =
           address: getAddress(deployment.exchange),
           contractName: `OfficialCTFExchangeV2-${deployment.variant}`,
           abi: exchangeAbi,
+        },
+        {
+          address: getAddress(deployment.ctf),
+          contractName: "OfficialConditionalTokens",
+          abi: conditionalTokensAbi,
         },
       ]
     : [
@@ -108,6 +132,30 @@ const addressConfigs =
 const configByAddress = new Map(
   addressConfigs.map((config) => [config.address.toLowerCase(), config]),
 );
+
+function ensureOrderHashes() {
+  if (deployment.mode !== OFFICIAL_MODE) return;
+  const orders = db
+    .prepare("SELECT * FROM orders WHERE chain_id = ? AND order_hash IS NULL")
+    .all(chainId);
+  const update = db.prepare(
+    `UPDATE orders
+     SET order_hash = :orderHash, raw_json = :rawJson, updated_at = CURRENT_TIMESTAMP
+     WHERE chain_id = :chainId AND local_order_id = :localOrderId`,
+  );
+  for (const row of orders) {
+    const contractOrder = toContractOrder(row);
+    const orderHash = orderHashFor(deployment, contractOrder);
+    const raw = JSON.parse(row.raw_json);
+    raw.orderHash = orderHash;
+    update.run({
+      chainId,
+      localOrderId: row.local_order_id,
+      orderHash,
+      rawJson: JSON.stringify(raw),
+    });
+  }
+}
 
 function bigintJson(value) {
   return JSON.stringify(value, (_, item) =>
@@ -211,6 +259,28 @@ function resolveMarketFromEvent(event) {
       winningOutcome: Number(event.args.winningOutcome),
     },
   );
+}
+
+function resolveOfficialMarketFromEvent(event, txHash) {
+  const payouts = event.args.payoutNumerators.map((value) => BigInt(value));
+  const winningOutcome =
+    payouts[0] > payouts[1] ? 1 : payouts[1] > payouts[0] ? 2 : 0;
+  const payoutDenominator = payouts.reduce((total, value) => total + value, 0n);
+  db.prepare(
+    `UPDATE markets
+     SET status = 'RESOLVED',
+         winning_outcome = :winningOutcome,
+         resolve_tx = :resolveTx,
+         payout_denominator = :payoutDenominator,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE chain_id = :chainId AND lower(condition_id) = lower(:conditionId)`,
+  ).run({
+    chainId,
+    conditionId: event.args.conditionId,
+    winningOutcome,
+    resolveTx: txHash,
+    payoutDenominator: payoutDenominator.toString(),
+  });
 }
 
 function upsertTradeFromEvent(event, txHash) {
@@ -360,7 +430,209 @@ function updateOrderFromCancelled(event, txHash) {
   }
 }
 
+function saveOrderFill(event, log) {
+  const args = event.args;
+  const orderHash = String(args.orderHash).toLowerCase();
+  const order = db
+    .prepare(
+      `SELECT local_order_id
+       FROM orders
+       WHERE chain_id = ? AND lower(order_hash) = ?
+       LIMIT 1`,
+    )
+    .get(chainId, orderHash);
+  upsert(
+    db,
+    `INSERT INTO order_fills(
+       chain_id, tx_hash, log_index, order_hash, local_order_id, maker, taker,
+       side, token_id, maker_amount_filled, taker_amount_filled, fee,
+       block_number, raw_json
+     ) VALUES(
+       :chainId, :txHash, :logIndex, :orderHash, :localOrderId, :maker, :taker,
+       :side, :tokenId, :makerAmountFilled, :takerAmountFilled, :fee,
+       :blockNumber, :rawJson
+     )
+     ON CONFLICT(chain_id, tx_hash, log_index) DO UPDATE SET
+       order_hash=excluded.order_hash,
+       local_order_id=excluded.local_order_id,
+       maker=excluded.maker,
+       taker=excluded.taker,
+       side=excluded.side,
+       token_id=excluded.token_id,
+       maker_amount_filled=excluded.maker_amount_filled,
+       taker_amount_filled=excluded.taker_amount_filled,
+       fee=excluded.fee,
+       block_number=excluded.block_number,
+       raw_json=excluded.raw_json`,
+    {
+      chainId,
+      txHash: log.transactionHash,
+      logIndex: Number(log.logIndex),
+      orderHash,
+      localOrderId: order?.local_order_id ?? null,
+      maker: args.maker,
+      taker: args.taker,
+      side: Number(args.side) === 0 ? "BUY" : "SELL",
+      tokenId: args.tokenId.toString(),
+      makerAmountFilled: args.makerAmountFilled.toString(),
+      takerAmountFilled: args.takerAmountFilled.toString(),
+      fee: args.fee.toString(),
+      blockNumber: Number(log.blockNumber),
+      rawJson: bigintJson(args),
+    },
+  );
+}
+
+function updateOrderPreapproval(event, txHash, invalidated) {
+  db.prepare(
+    `UPDATE orders
+     SET preapproved = :preapproved,
+         invalidated = :invalidated,
+         status = CASE
+           WHEN :invalidated = 1 AND status IN ('OPEN', 'PARTIALLY_FILLED')
+             THEN 'CANCELLED'
+           ELSE status
+         END,
+         last_chain_tx = :txHash,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE chain_id = :chainId AND lower(order_hash) = lower(:orderHash)`,
+  ).run({
+    chainId,
+    orderHash: event.args.orderHash,
+    preapproved: invalidated ? 0 : 1,
+    invalidated: invalidated ? 1 : 0,
+    txHash,
+  });
+}
+
+function updateOrdersForUserPause(event, txHash, paused) {
+  if (paused) {
+    db.prepare(
+      `UPDATE orders
+       SET status = 'USER_PAUSED', last_chain_tx = :txHash,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE chain_id = :chainId AND lower(maker) = lower(:maker)
+         AND status IN ('OPEN', 'PARTIALLY_FILLED')`,
+    ).run({
+      chainId,
+      maker: event.args.user,
+      txHash,
+    });
+    return;
+  }
+  db.prepare(
+    `UPDATE orders
+     SET status = CASE
+       WHEN CAST(filled_maker_amount AS INTEGER) > 0
+         OR CAST(filled_taker_amount AS INTEGER) > 0
+         THEN 'PARTIALLY_FILLED'
+       ELSE 'OPEN'
+     END,
+     last_chain_tx = :txHash,
+     updated_at = CURRENT_TIMESTAMP
+     WHERE chain_id = :chainId AND lower(maker) = lower(:maker)
+       AND status = 'USER_PAUSED'`,
+  ).run({
+    chainId,
+    maker: event.args.user,
+    txHash,
+  });
+}
+
+async function reconcileOrdersFromFills() {
+  if (deployment.mode !== OFFICIAL_MODE) return;
+  const orders = db
+    .prepare(
+      `SELECT *
+       FROM orders
+       WHERE chain_id = ? AND order_hash IS NOT NULL`,
+    )
+    .all(chainId);
+  const totals = db.prepare(
+    `SELECT
+       COALESCE(SUM(CAST(maker_amount_filled AS INTEGER)), 0) AS maker_filled,
+       COALESCE(SUM(CAST(taker_amount_filled AS INTEGER)), 0) AS taker_filled
+     FROM order_fills
+     WHERE chain_id = ? AND lower(order_hash) = lower(?)`,
+  );
+  const latest = db.prepare(
+    `SELECT tx_hash
+     FROM order_fills
+     WHERE chain_id = ? AND lower(order_hash) = lower(?)
+     ORDER BY block_number DESC, log_index DESC
+     LIMIT 1`,
+  );
+  const update = db.prepare(
+    `UPDATE orders
+     SET filled_maker_amount = :filledMaker,
+         filled_taker_amount = :filledTaker,
+         status = :status,
+         last_chain_tx = :lastChainTx,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE chain_id = :chainId AND local_order_id = :localOrderId`,
+  );
+  for (const order of orders) {
+    const sum = totals.get(chainId, order.order_hash);
+    let filledMaker = BigInt(sum.maker_filled);
+    let filledTaker = BigInt(sum.taker_filled);
+    let chainFilled = false;
+    try {
+      const chainStatus = await publicClient.readContract({
+        address: deployment.exchange,
+        abi: exchangeAbi,
+        functionName: "getOrderStatus",
+        args: [order.order_hash],
+      });
+      chainFilled = Boolean(chainStatus.filled);
+      const remaining = BigInt(chainStatus.remaining);
+      const chainMakerFilled =
+        chainFilled || remaining > 0n
+          ? BigInt(order.maker_amount) - remaining
+          : 0n;
+      if (chainMakerFilled > filledMaker) {
+        filledMaker = chainMakerFilled;
+        filledTaker =
+          (chainMakerFilled * BigInt(order.taker_amount)) /
+          BigInt(order.maker_amount);
+      }
+    } catch (error) {
+      console.warn(
+        `读取订单链上状态失败 ${order.local_order_id}：${
+          error instanceof Error ? error.message.split("\n")[0] : String(error)
+        }`,
+      );
+    }
+    if (filledMaker === 0n && filledTaker === 0n && !chainFilled) continue;
+    let status =
+      chainFilled ||
+      filledMaker >= BigInt(order.maker_amount) ||
+      filledTaker >= BigInt(order.taker_amount)
+        ? "FILLED"
+        : "PARTIALLY_FILLED";
+    if (order.status === "CANCELLED" && status !== "FILLED") status = "CANCELLED";
+    if (order.status === "USER_PAUSED" && status !== "FILLED") {
+      status = "USER_PAUSED";
+    }
+    update.run({
+      chainId,
+      localOrderId: order.local_order_id,
+      filledMaker: filledMaker.toString(),
+      filledTaker: filledTaker.toString(),
+      status,
+      lastChainTx: latest.get(chainId, order.order_hash)?.tx_hash ?? null,
+    });
+  }
+}
+
 function saveEvent(log, decoded, config) {
+  if (
+    deployment.mode === OFFICIAL_MODE &&
+    ["ConditionResolution", "PayoutRedemption"].includes(decoded.eventName) &&
+    String(decoded.args.conditionId).toLowerCase() !==
+      String(deployment.market?.conditionId ?? "").toLowerCase()
+  ) {
+    return;
+  }
   upsert(
     db,
     `INSERT INTO chain_events(
@@ -395,6 +667,18 @@ function saveEvent(log, decoded, config) {
     upsertTradeFromOrdersMatched(decoded, log.transactionHash);
   } else if (decoded.eventName === "OrderCancelled") {
     updateOrderFromCancelled(decoded, log.transactionHash);
+  } else if (decoded.eventName === "OrderFilled") {
+    saveOrderFill(decoded, log);
+  } else if (decoded.eventName === "ConditionResolution") {
+    resolveOfficialMarketFromEvent(decoded, log.transactionHash);
+  } else if (decoded.eventName === "OrderPreapproved") {
+    updateOrderPreapproval(decoded, log.transactionHash, false);
+  } else if (decoded.eventName === "OrderPreapprovalInvalidated") {
+    updateOrderPreapproval(decoded, log.transactionHash, true);
+  } else if (decoded.eventName === "UserPaused") {
+    updateOrdersForUserPause(decoded, log.transactionHash, true);
+  } else if (decoded.eventName === "UserUnpaused") {
+    updateOrdersForUserPause(decoded, log.transactionHash, false);
   }
 }
 
@@ -448,6 +732,7 @@ async function getLogsForAddressReliable(params) {
 }
 
 async function syncKnownTransactions() {
+  ensureOrderHashes();
   const deploymentTxHashes = Object.values(deployment.txs ?? {}).filter(
     (hash) => typeof hash === "string" && hash.startsWith("0x"),
   );
@@ -469,7 +754,6 @@ async function syncKnownTransactions() {
      WHERE chain_id = ?
        AND lower(contract_address) IN (${placeholders})`,
   ).run(chainId, ...selectedAddresses);
-
   for (const txHash of txHashes) {
     const receipt = await publicClient.getTransactionReceipt({ hash: txHash });
     for (const log of receipt.logs) {
@@ -491,6 +775,7 @@ async function syncKnownTransactions() {
   }
 
   const latestBlock = await publicClient.getBlockNumber();
+  await reconcileOrdersFromFills();
   setSyncState(latestBlock);
   console.log(`已同步已知交易 ${txHashes.length} 笔，解析事件 ${decodedCount} 条`);
   console.log(`sync_state 已更新到 latestBlock=${latestBlock}`);
@@ -502,6 +787,8 @@ if (process.env.FULL_SYNC !== "true") {
   db.close();
   process.exit(0);
 }
+
+ensureOrderHashes();
 
 const state = getSyncState();
 const chainLatestBlock = await publicClient.getBlockNumber();
@@ -556,6 +843,7 @@ while (fromBlock <= latestBlock) {
   fromBlock = toBlock + 1n;
 }
 
+await reconcileOrdersFromFills();
 db.close();
 console.log(`同步完成：读取 logs=${synced}，解析事件=${decodedCount}`);
 console.log(`数据库：${dbPath}`);

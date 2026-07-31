@@ -82,11 +82,13 @@ if (runtime.market) {
     db,
     `INSERT INTO markets(
        chain_id, market_id, creator, question, yes_token_id, no_token_id,
-       close_time, status, winning_outcome, market_registry, created_tx, updated_at
+       close_time, status, winning_outcome, question_id, condition_id, oracle,
+       close_tx, resolve_tx, payout_denominator, market_registry, created_tx, updated_at
      )
      VALUES(
        :chainId, :marketId, '', :question, :yesTokenId, :noTokenId,
-       :closeTime, :status, :winningOutcome, :marketRegistry, NULL, :updatedAt
+       :closeTime, :status, :winningOutcome, :questionId, :conditionId, :oracle,
+       :closeTx, :resolveTx, :payoutDenominator, :marketRegistry, :createdTx, :updatedAt
      )
      ON CONFLICT(chain_id, market_id) DO UPDATE SET
        question=excluded.question,
@@ -95,6 +97,12 @@ if (runtime.market) {
        close_time=excluded.close_time,
        status=excluded.status,
        winning_outcome=excluded.winning_outcome,
+       question_id=excluded.question_id,
+       condition_id=excluded.condition_id,
+       oracle=excluded.oracle,
+       close_tx=excluded.close_tx,
+       resolve_tx=excluded.resolve_tx,
+       payout_denominator=excluded.payout_denominator,
        market_registry=excluded.market_registry,
        updated_at=excluded.updated_at`,
     {
@@ -106,7 +114,14 @@ if (runtime.market) {
       closeTime: runtime.market.closeTime,
       status: runtime.market.status,
       winningOutcome: runtime.market.winningOutcome,
+      questionId: runtime.market.questionId ?? null,
+      conditionId: runtime.market.conditionId,
+      oracle: runtime.market.oracle ?? null,
+      closeTx: runtime.market.closeTx ?? null,
+      resolveTx: runtime.market.resolveTx ?? null,
+      payoutDenominator: runtime.market.payoutDenominator ?? "0",
       marketRegistry: runtime.officialDependencies?.outcomeTokenFactory ?? runtime.ctf,
+      createdTx: runtime.market.prepareTx ?? null,
       updatedAt: now,
     },
   );
