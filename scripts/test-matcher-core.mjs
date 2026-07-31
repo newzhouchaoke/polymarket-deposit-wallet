@@ -45,6 +45,11 @@ insertOrder("sell-a", "SELL", 500_000, 250_000, 500_000, 2);
 insertOrder("sell-b", "SELL", 800_000, 440_000, 550_000, 3);
 insertOrder("sell-c", "SELL", 1_000_000, 580_000, 580_000, 4);
 insertOrder("sell-too-expensive", "SELL", 1_000_000, 700_000, 700_000, 5);
+insertOrder("invalid-buy", "BUY", 1_400_000, 2_000_000, 700_000, 6);
+db.prepare(
+  `UPDATE orders SET validation_status = 'INVALID'
+   WHERE local_order_id = 'invalid-buy'`,
+).run();
 
 const match = bestMatch(db, 5);
 assert.equal(match.buy.local_order_id, "buy");

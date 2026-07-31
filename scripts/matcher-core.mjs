@@ -81,6 +81,7 @@ export function bestMatch(db, maxMakers = Number(process.env.MATCHER_MAX_MAKERS 
      WHERE side = 'BUY'
        AND status IN ('OPEN', 'PARTIALLY_FILLED')
        AND signature IS NOT NULL
+       AND validation_status <> 'INVALID'
        AND (expiration = 0 OR expiration > CAST(strftime('%s','now') AS INTEGER))
        AND CAST(filled_maker_amount AS INTEGER) < CAST(maker_amount AS INTEGER)
        AND CAST(filled_taker_amount AS INTEGER) < CAST(taker_amount AS INTEGER)
@@ -95,6 +96,7 @@ export function bestMatch(db, maxMakers = Number(process.env.MATCHER_MAX_MAKERS 
      WHERE side = 'SELL'
        AND status IN ('OPEN', 'PARTIALLY_FILLED')
        AND signature IS NOT NULL
+       AND validation_status <> 'INVALID'
        AND (expiration = 0 OR expiration > CAST(strftime('%s','now') AS INTEGER))
        AND CAST(filled_maker_amount AS INTEGER) < CAST(maker_amount AS INTEGER)
        AND CAST(filled_taker_amount AS INTEGER) < CAST(taker_amount AS INTEGER)

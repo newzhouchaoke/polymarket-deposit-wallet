@@ -8,7 +8,9 @@ import { WebSocketServer } from "ws";
 import { getAddress, isHex } from "viem";
 import { dbMode, dbPath, initSchema, openDatabase, projectDir } from "./db.js";
 import { readMatcherStatus } from "./matcher-core.mjs";
+import { expireOrders, orderStats } from "./order-maintenance.mjs";
 import { orderHashFor, sideNumber } from "./order-utils.mjs";
+import { validateSignedOrder } from "./order-validation.mjs";
 import { officialModulesStatus } from "./official-modules-status.mjs";
 import { readJsonStatus, statusWithLiveness } from "./service-utils.mjs";
 import {
@@ -34,6 +36,14 @@ const writeRateLimit = Number(process.env.API_WRITE_RATE_LIMIT_PER_MINUTE ?? "30
 const realtimePollMs = Number(process.env.API_REALTIME_POLL_MS ?? "2000");
 const healthRequireChainSync =
   String(process.env.HEALTH_REQUIRE_CHAIN_SYNC ?? "true").toLowerCase() === "true";
+const requireSignedOrders =
+  String(
+    process.env.API_REQUIRE_SIGNED_ORDERS ??
+      (exchangeRuntime.mode === "official-v2" ? "true" : "false"),
+  ).toLowerCase() === "true";
+const validateSignedOrders =
+  String(process.env.API_VALIDATE_SIGNED_ORDERS ?? "true").toLowerCase() === "true";
+const orderExpirySweepMs = Number(process.env.ORDER_EXPIRY_SWEEP_MS ?? "10000");
 const rateWindows = new Map();
 const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
 
@@ -44,6 +54,9 @@ if (!loopbackHosts.has(host) && !writeToken) {
 }
 if (!Number.isInteger(realtimePollMs) || realtimePollMs < 500) {
   throw new Error("API_REALTIME_POLL_MS 必须是 >= 500 的整数毫秒");
+}
+if (!Number.isInteger(orderExpirySweepMs) || orderExpirySweepMs < 1000) {
+  throw new Error("ORDER_EXPIRY_SWEEP_MS 必须是 >= 1000 的整数毫秒");
 }
 
 function rows(sql, params = {}) {
@@ -305,7 +318,7 @@ function localOrderId(order) {
   return `local-${crypto.createHash("sha256").update(raw).digest("hex")}`;
 }
 
-function insertOrder(order) {
+async function insertOrder(order) {
   const marketId = requireString(order.marketId, "marketId");
   const market = one("SELECT * FROM markets WHERE market_id = :marketId", {
     marketId,
@@ -457,16 +470,45 @@ function insertOrder(order) {
   );
   if (existingByHash) return { ...existingByHash, idempotent: true };
 
+  if (requireSignedOrders && !normalized.signature) {
+    throw Object.assign(
+      new Error(
+        "official-v2 API requires a signed order; use the signed-order generator or provide signature",
+      ),
+      { statusCode: 400 },
+    );
+  }
+  let validation = {
+    status: normalized.signature ? "VALIDATION_SKIPPED" : "UNSIGNED",
+    error: null,
+    validatedAt: null,
+  };
+  if (normalized.signature && validateSignedOrders) {
+    validation = await validateSignedOrder(exchangeConfig, {
+      salt: normalized.salt,
+      maker: normalized.maker,
+      signer: normalized.signer,
+      token_id: normalized.tokenId,
+      maker_amount: normalized.makerAmount,
+      taker_amount: normalized.takerAmount,
+      side: normalized.side,
+      signature: normalized.signature,
+      raw_json: JSON.stringify(normalized),
+    });
+  }
+
   db.prepare(
     `INSERT INTO orders(
        chain_id, local_order_id, market_id, maker, signer, side, token_id,
        maker_amount, taker_amount, filled_maker_amount, filled_taker_amount,
-       price_micros, status, expiration, salt, signature, order_hash, raw_json, updated_at
+       price_micros, status, expiration, salt, signature, order_hash,
+       validation_status, validation_error, validated_at, raw_json, updated_at
      )
      VALUES(
        :chainId, :localOrderId, :marketId, :maker, :signer, :side, :tokenId,
        :makerAmount, :takerAmount, :filledMakerAmount, :filledTakerAmount,
-       :priceMicros, :status, :expiration, :salt, :signature, :orderHash, :rawJson, CURRENT_TIMESTAMP
+       :priceMicros, :status, :expiration, :salt, :signature, :orderHash,
+       :validationStatus, :validationError, :validatedAt, :rawJson, CURRENT_TIMESTAMP
      )`,
   ).run({
     chainId: market.chain_id,
@@ -486,6 +528,9 @@ function insertOrder(order) {
     salt: normalized.salt,
     signature: normalized.signature,
     orderHash,
+    validationStatus: validation.status,
+    validationError: validation.error,
+    validatedAt: validation.validatedAt,
     rawJson: JSON.stringify(normalized),
   });
 
@@ -779,6 +824,7 @@ function indexPage() {
     ["/api/wallets", "Deposit Wallet"],
     ["/api/markets", "市场"],
     ["/api/orders", "订单"],
+    ["/api/orders/stats", "订单状态与签名校验统计"],
     ["/api/markets/:id/orderbook", "指定市场订单簿"],
     ["/api/orderbook", "订单簿"],
     ["/api/trades", "成交"],
@@ -1041,9 +1087,16 @@ function tradePage() {
               <input name="salt" value="${Date.now()}" />
             </div>
           </div>
-          <label>signature（可选；无签名订单不能链上撮合）</label>
+          <label>签名类型</label>
+          <select name="signatureType">
+            <option value="0">0 - EOA</option>
+            <option value="1" ${officialRuntime ? "selected" : ""}>1 - POLY_PROXY</option>
+            <option value="2">2 - POLY_GNOSIS_SAFE</option>
+            <option value="3" ${officialRuntime ? "" : "selected"}>3 - POLY_1271</option>
+          </select>
+          <label>signature（${officialRuntime ? "官方模式默认必填，入库前调用 validateOrder" : "可选；无签名订单不能链上撮合"}）</label>
           <input name="signature" value="" />
-          <button type="submit">提交订单</button>
+          <button type="submit">${officialRuntime ? "校验并提交签名订单" : "提交订单"}</button>
         </form>
       </div>
 
@@ -1084,7 +1137,7 @@ function tradePage() {
 
       <div class="card section">
         <h2>最近订单</h2>
-        <div class="table-wrap"><table id="orders-table"><thead><tr><th>ID</th><th>方向</th><th>价格</th><th>成交进度</th><th>状态</th><th>签名</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+        <div class="table-wrap"><table id="orders-table"><thead><tr><th>ID</th><th>方向</th><th>价格</th><th>成交进度</th><th>状态</th><th>签名</th><th>校验</th><th>操作</th></tr></thead><tbody></tbody></table></div>
       </div>
 
       <div class="card section">
@@ -1216,11 +1269,12 @@ function tradePage() {
       ordersBody.innerHTML = orders.map((item) => {
         const filled = item.filled_maker_amount + "/" + item.maker_amount + " | " + item.filled_taker_amount + "/" + item.taker_amount;
         const signature = item.signature ? "yes" : "no";
+        const validation = item.validation_status || "UNVERIFIED";
         const canCancel = (item.status === "OPEN" || item.status === "PARTIALLY_FILLED") && item.signature;
         const cancelButton = canCancel ? '<button class="mini warn cancel-row" data-id="' + item.local_order_id + '">取消</button>' : '';
         const copyButton = '<button class="mini secondary use-row" data-id="' + item.local_order_id + '">选中</button>';
-        return "<tr><td><code>" + item.local_order_id + "</code></td><td>" + sidePill(item.side) + "</td><td>" + item.price_micros + "</td><td>" + filled + "</td><td>" + statusPill(item.status) + "</td><td>" + signature + "</td><td class='nowrap'>" + copyButton + cancelButton + "</td></tr>";
-      }).join("") || emptyRow(7, "暂无订单");
+        return "<tr><td><code>" + item.local_order_id + "</code></td><td>" + sidePill(item.side) + "</td><td>" + item.price_micros + "</td><td>" + filled + "</td><td>" + statusPill(item.status) + "</td><td>" + signature + "</td><td>" + validation + "</td><td class='nowrap'>" + copyButton + cancelButton + "</td></tr>";
+      }).join("") || emptyRow(8, "暂无订单");
 
       tradesBody.innerHTML = trades.map((item) =>
         '<tr><td><a target="_blank" rel="noreferrer" href="https://amoy.polygonscan.com/tx/' + item.tx_hash + '">' + shortText(item.tx_hash, 8) + '</a></td><td class="mono">' + shortText(item.buyer, 8) + '</td><td class="mono">' + shortText(item.seller, 8) + '</td><td class="right">' + item.outcome_amount + '</td><td class="right">' + item.collateral_amount + '</td></tr>'
@@ -1718,6 +1772,7 @@ function serviceMetrics() {
       ).count,
       trades: one("SELECT COUNT(*) AS count FROM trades").count,
       chainEvents: one("SELECT COUNT(*) AS count FROM chain_events").count,
+      orderStats: orderStats(db),
     },
     matcher: readMatcherStatus(),
     chainSync: readChainSyncStatus(),
@@ -1777,6 +1832,7 @@ const routes = {
       params,
     );
   },
+  "/api/orders/stats": () => orderStats(db),
   "/api/orderbook": (url) => {
     const requestedMarketId = url.searchParams.get("marketId");
     const market = requestedMarketId
@@ -2034,7 +2090,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (url.pathname === "/api/orders") {
         requestBody = await readJsonBody(req);
-        const result = insertOrder(requestBody);
+        const result = await insertOrder(requestBody);
         return respondAction(
           result.idempotent ? 200 : 201,
           result.idempotent ? "ORDER_CREATE_IDEMPOTENT" : "ORDER_CREATE",
@@ -2182,11 +2238,12 @@ const server = http.createServer(async (req, res) => {
         message: error instanceof Error ? error.message : String(error),
       });
     }
-    if ([400, 409, 413].includes(statusCode)) {
+    if ([400, 409, 413, 422].includes(statusCode)) {
       const names = {
         400: "BAD_REQUEST",
         409: "CONFLICT",
         413: "PAYLOAD_TOO_LARGE",
+        422: "ORDER_VALIDATION_FAILED",
       };
       return json(res, statusCode, {
         error: names[statusCode],
@@ -2257,6 +2314,17 @@ const rateLimitCleanup = setInterval(() => {
 }, 60_000);
 rateLimitCleanup.unref();
 
+const orderExpirySweep = setInterval(() => {
+  try {
+    const changes = expireOrders(db);
+    if (changes > 0) broadcastRealtime("orders-expired");
+  } catch (error) {
+    console.error("[api] 订单过期维护失败：", error);
+  }
+}, orderExpirySweepMs);
+orderExpirySweep.unref();
+expireOrders(db);
+
 server.listen(port, host, () => {
   console.log(
     `Polymarket ${exchangeRuntime.mode} API 已启动：http://${host}:${port}`,
@@ -2271,6 +2339,7 @@ function shutdown() {
   clearInterval(realtimePoll);
   clearInterval(websocketHeartbeat);
   clearInterval(rateLimitCleanup);
+  clearInterval(orderExpirySweep);
   for (const socket of websocketServer.clients) socket.close(1001, "server shutdown");
   websocketServer.close();
   const forceExit = setTimeout(() => {

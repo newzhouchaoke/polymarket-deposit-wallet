@@ -162,12 +162,14 @@ export function insertDbOrder(db, deployment, localOrderId, order, signature, st
     `INSERT INTO orders(
        chain_id, local_order_id, market_id, maker, signer, side, token_id,
        maker_amount, taker_amount, filled_maker_amount, filled_taker_amount,
-       price_micros, status, expiration, salt, signature, order_hash, raw_json, updated_at
+       price_micros, status, expiration, salt, signature, order_hash,
+       validation_status, validated_at, raw_json, updated_at
      )
      VALUES(
        :chainId, :localOrderId, :marketId, :maker, :signer, :side, :tokenId,
        :makerAmount, :takerAmount, '0', '0',
-       :priceMicros, :status, :expiration, :salt, :signature, :orderHash, :rawJson, :updatedAt
+       :priceMicros, :status, :expiration, :salt, :signature, :orderHash,
+       'LOCALLY_SIGNED', :updatedAt, :rawJson, :updatedAt
      )
      ON CONFLICT(chain_id, local_order_id) DO UPDATE SET
        market_id=excluded.market_id,
@@ -185,6 +187,9 @@ export function insertDbOrder(db, deployment, localOrderId, order, signature, st
        salt=excluded.salt,
        signature=excluded.signature,
        order_hash=excluded.order_hash,
+       validation_status=excluded.validation_status,
+       validation_error=NULL,
+       validated_at=excluded.validated_at,
        raw_json=excluded.raw_json,
        updated_at=excluded.updated_at`,
     {

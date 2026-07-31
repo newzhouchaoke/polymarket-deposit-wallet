@@ -97,6 +97,9 @@ export function initSchema(db) {
       preapproved INTEGER NOT NULL DEFAULT 0,
       invalidated INTEGER NOT NULL DEFAULT 0,
       last_chain_tx TEXT,
+      validation_status TEXT NOT NULL DEFAULT 'UNVERIFIED',
+      validation_error TEXT,
+      validated_at TEXT,
       raw_json TEXT NOT NULL,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (chain_id, local_order_id),
@@ -296,6 +299,24 @@ export function initSchema(db) {
       db.exec(`ALTER TABLE orders ADD COLUMN ${name} ${definition};`);
     }
   }
+  for (const [name, definition] of [
+    ["validation_status", "TEXT NOT NULL DEFAULT 'UNVERIFIED'"],
+    ["validation_error", "TEXT"],
+    ["validated_at", "TEXT"],
+  ]) {
+    if (!orderColumns.some((column) => column.name === name)) {
+      db.exec(`ALTER TABLE orders ADD COLUMN ${name} ${definition};`);
+    }
+  }
+  db.exec(`
+    UPDATE orders
+    SET validation_status = CASE
+      WHEN signature IS NULL OR signature = '' THEN 'UNSIGNED'
+      ELSE 'LEGACY_SIGNED'
+    END
+    WHERE validation_status = 'UNVERIFIED'
+      AND validated_at IS NULL;
+  `);
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_orders_order_hash
       ON orders(chain_id, order_hash);

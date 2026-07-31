@@ -383,6 +383,9 @@ API_WRITE_TOKEN=
 API_READ_RATE_LIMIT_PER_MINUTE=300
 API_WRITE_RATE_LIMIT_PER_MINUTE=30
 API_REALTIME_POLL_MS=2000
+API_REQUIRE_SIGNED_ORDERS=true
+API_VALIDATE_SIGNED_ORDERS=true
+ORDER_EXPIRY_SWEEP_MS=10000
 HEALTH_REQUIRE_CHAIN_SYNC=true
 SERVICE_STATUS_STALE_MS=180000
 ```
@@ -399,9 +402,22 @@ npm run test:api
 实时通道为 `ws://127.0.0.1:8787/ws?marketId=...`，连接后立即推送市场、订单簿、最近
 订单和成交快照；API 写入或同步数据库变化时会再次推送。交易页会自动连接和重连。
 
-`POST /api/orders` 现在会严格验证 EVM 地址、市场 tokenId、uint256/bytes32 字段、
-签名类型、价格、过期时间和初始成交量。相同订单重复提交返回已有记录，不会把已经部分
-成交或取消的订单重置为 `OPEN`；同一个 `localOrderId` 指向不同订单时返回 HTTP 409。
+`POST /api/orders` 会严格验证 EVM 地址、市场 tokenId、uint256/bytes32 字段、签名类型、
+价格、过期时间和初始成交量。official-v2 默认要求签名，并在入库前对已部署 Exchange
+执行只读 `validateOrder`；校验失败返回 HTTP 422，不会进入订单簿。相同订单重复提交返回
+已有记录，不会把已经部分成交或取消的订单重置为 `OPEN`；同一个 `localOrderId` 指向
+不同订单时返回 HTTP 409。
+
+订单保存 `VALID`、`INVALID`、`LOCALLY_SIGNED`、`LEGACY_SIGNED`、`UNSIGNED` 或
+`VALIDATION_SKIPPED` 校验状态。现有活动签名订单可以批量重新校验：
+
+```bash
+npm run orders:validate
+curl http://127.0.0.1:8787/api/orders/stats
+```
+
+该命令只读取 Amoy Exchange 并更新本地数据库，不发送交易。API 每 10 秒把到期的
+`OPEN/PARTIALLY_FILLED` 订单更新为 `EXPIRED`，WebSocket 随后推送新订单簿。
 
 ### 健康检查、指标和故障退避
 

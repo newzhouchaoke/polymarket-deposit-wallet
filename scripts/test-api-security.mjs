@@ -16,6 +16,7 @@ const commonEnvironment = {
   ...process.env,
   POLYMARKET_DB_PATH: testDatabasePath,
   HEALTH_REQUIRE_CHAIN_SYNC: "false",
+  API_REQUIRE_SIGNED_ORDERS: "false",
 };
 const importResult = spawnSync("node", ["scripts/db-import-runtime.mjs"], {
   cwd: projectDir,
@@ -86,6 +87,10 @@ try {
     (response) => response.json(),
   );
   assert.equal(metrics.database.health.ok, true);
+  const initialStats = await fetch(
+    `http://127.0.0.1:${port}/api/orders/stats`,
+  ).then((response) => response.json());
+  assert.ok(Array.isArray(initialStats.byValidation));
 
   const order = {
     localOrderId: "api-idempotency-test",
@@ -110,7 +115,9 @@ try {
     body: JSON.stringify(order),
   });
   assert.equal(created.status, 201);
-  assert.equal((await created.json()).idempotent, false);
+  const createdOrder = await created.json();
+  assert.equal(createdOrder.idempotent, false);
+  assert.equal(createdOrder.validation_status, "UNSIGNED");
 
   const repeated = await fetch(`http://127.0.0.1:${port}/api/orders`, {
     method: "POST",
