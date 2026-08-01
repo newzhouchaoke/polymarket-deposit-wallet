@@ -5,7 +5,7 @@ import { dbPath, initSchema, openDatabase, projectDir, upsert } from "./db.js";
 const deploymentPath = path.join(
   projectDir,
   "deployments",
-  "research-official-like-amoy.json",
+  "research-v2-amoy.json",
 );
 
 if (!fs.existsSync(deploymentPath)) {
@@ -34,11 +34,11 @@ function insertContract(name, address, role, createdTx = null, notes = "") {
   );
 }
 
-function insertWallet(walletRole, walletAddress, createdTx = null) {
+function insertWallet(walletRole, walletAddress, walletType, createdTx = null) {
   upsert(
     db,
     `INSERT INTO wallets(chain_id, wallet_address, owner_address, wallet_role, wallet_type, created_tx, updated_at)
-     VALUES(:chainId, :walletAddress, :ownerAddress, :walletRole, 'ResearchDepositWallet', :createdTx, :updatedAt)
+     VALUES(:chainId, :walletAddress, :ownerAddress, :walletRole, :walletType, :createdTx, :updatedAt)
      ON CONFLICT(chain_id, wallet_address) DO UPDATE SET
        owner_address=excluded.owner_address,
        wallet_role=excluded.wallet_role,
@@ -50,6 +50,7 @@ function insertWallet(walletRole, walletAddress, createdTx = null) {
       walletAddress,
       ownerAddress: deployment.owner,
       walletRole,
+      walletType,
       createdTx,
       updatedAt: now,
     },
@@ -115,7 +116,7 @@ function insertOrder(localOrderId, order, status) {
       filledTakerAmount,
       priceMicros: priceMicros(order),
       status,
-      expiration: Number(order.expiration),
+      expiration: Number(order.expiration ?? 0),
       salt: order.salt,
       signature: order.signature ?? null,
       rawJson: JSON.stringify(order),
@@ -125,21 +126,21 @@ function insertOrder(localOrderId, order, status) {
 }
 
 insertContract("ResearchWalletCoin", deployment.walletCoin, "collateral token", null, "rWALLET");
-insertContract("ResearchOutcomeToken", deployment.outcomeToken, "outcome token", null, "YES/NO ERC-1155-like token");
+insertContract("ResearchOutcomeToken", deployment.outcomeToken, "conditional tokens", null, "ERC-1155 YES/NO with split, merge and redeem");
 insertContract("ResearchMarketRegistry", deployment.marketRegistry, "market hub", deployment.txs.publishTx, "Publishes markets and lifecycle events");
-insertContract("ResearchDepositWalletFactory", deployment.walletFactory, "wallet factory", null, "CREATE2 wallet factory");
+insertContract("ResearchDepositWalletFactory", deployment.walletFactory, "wallet factory", deployment.txs.createWalletTx, "CREATE2 ERC-1967 BeaconProxy wallet factory");
 if (deployment.exchange) {
   insertContract(
     "ResearchCLOBExchange",
     deployment.exchange,
     "exchange",
     deployment.txs.deployExchangeTx ?? deployment.txs.matchTx,
-    "Verifies signed orders, cancellations, partial fills, and settles matched trades",
+    "V2-style EIP-712 orders, one-to-many matching, complementary/mint/merge settlement",
   );
 }
 
-insertWallet("buyer", deployment.buyerWallet);
-insertWallet("seller", deployment.sellerWallet);
+insertWallet("buyer", deployment.buyerWallet, "ResearchDepositWallet", deployment.txs.createWalletTx);
+insertWallet("seller", deployment.sellerWallet, "EOA");
 
 upsert(
   db,
@@ -176,7 +177,7 @@ upsert(
   },
 );
 
-insertOrder("research-buy-order", deployment.orders.buyOrder, "FILLED");
+insertOrder("research-buy-order", deployment.orders.buyOrder, "PARTIALLY_FILLED");
 insertOrder("research-sell-order", deployment.orders.sellOrder, "FILLED");
 
 upsert(
@@ -220,6 +221,7 @@ const balances = [
   [deployment.sellerWallet, "rWALLET", "", deployment.finalBalances.sellerRWALLET],
   [deployment.buyerWallet, "YES", deployment.market.yesTokenId, deployment.finalBalances.buyerYES],
   [deployment.sellerWallet, "YES", deployment.market.yesTokenId, deployment.finalBalances.sellerYES],
+  [deployment.sellerWallet, "NO", deployment.market.noTokenId, deployment.finalBalances.sellerNO],
 ];
 
 for (const [walletAddress, tokenSymbol, tokenId, balanceDecimal] of balances) {
@@ -247,16 +249,18 @@ for (const [walletAddress, tokenSymbol, tokenId, balanceDecimal] of balances) {
 
 const events = [
   ["MarketPublished", deployment.marketRegistry, deployment.txs.publishTx, deployment.market],
-  ["Transfer", deployment.walletCoin, deployment.txs.mintBuyerCoinTx, { to: deployment.buyerWallet, amount: "100000000" }],
-  ["TransferSingle", deployment.outcomeToken, deployment.txs.mintSellerYesTx, { to: deployment.sellerWallet, tokenId: deployment.market.yesTokenId, amount: "10000000" }],
-  ["ApprovalForAll", deployment.outcomeToken, deployment.txs.sellerApproveTx, { owner: deployment.sellerWallet, operator: deployment.marketRegistry }],
-  ["TradeExecuted", deployment.marketRegistry, deployment.txs.matchTx, {
+  ["PositionSplit", deployment.outcomeToken, deployment.txs.splitTx, {
+    stakeholder: deployment.sellerWallet,
+    conditionId: deployment.market.conditionId,
+    amount: "10000000",
+  }],
+  ["OrdersMatched", deployment.exchange, deployment.txs.matchTx, {
     marketId: deployment.market.marketId,
     buyer: deployment.buyerWallet,
     seller: deployment.sellerWallet,
     tokenId: deployment.market.yesTokenId,
     outcomeAmount: deployment.orders.sellOrder.makerAmount,
-    walletCoinAmount: deployment.orders.sellOrder.takerAmount,
+    collateralAmount: deployment.orders.sellOrder.takerAmount,
   }],
 ];
 

@@ -1,0 +1,10 @@
+{
+  "marketId": "0x...",
+  "conditionId": "0x...",
+  "question": "Amoy research market",
+  "yesTokenId": "0",
+  "noTokenId": "0",
+  "closeTime": 0,
+  "status": "OPEN",
+  "winningOutcome": 0
+}

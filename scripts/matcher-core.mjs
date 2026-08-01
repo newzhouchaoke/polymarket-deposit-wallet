@@ -8,12 +8,26 @@ import {
   loadDeployment,
   openResearchDb,
   projectDir,
-  readArtifact,
+  readCurrentExchangeArtifact,
   toContractOrder,
   upsert,
 } from "./order-utils.mjs";
+import { dbMode } from "./db.js";
+import {
+  atomicWriteJson,
+  readJsonStatus,
+  statusWithLiveness,
+} from "./service-utils.mjs";
+import {
+  auditActiveReservations,
+  syncOrderReservation,
+} from "./order-risk.mjs";
 
-export const matcherStatusPath = path.join(projectDir, "data", "matcher-status.json");
+export const matcherStatusPath = path.join(
+  projectDir,
+  "data",
+  `matcher-${dbMode}-status.json`,
+);
 
 export function amoyRpcUrls() {
   const configured = process.env.AMOY_RPC_URLS || process.env.AMOY_RPC_URL;
@@ -37,35 +51,66 @@ export function amoyTransport() {
   );
 }
 
+function compactError(error) {
+  const message =
+    error && typeof error === "object" && typeof error.shortMessage === "string"
+      ? error.shortMessage
+      : error instanceof Error
+        ? error.message
+        : String(error);
+  return message.replace(/\s+/g, " ").trim();
+}
+
 export function writeMatcherStatus(status) {
-  fs.mkdirSync(path.dirname(matcherStatusPath), { recursive: true });
-  fs.writeFileSync(
+  atomicWriteJson(
     matcherStatusPath,
-    `${JSON.stringify({ updatedAt: new Date().toISOString(), ...status }, null, 2)}\n`,
+    { updatedAt: new Date().toISOString(), ...status },
   );
 }
 
 export function readMatcherStatus() {
-  if (!fs.existsSync(matcherStatusPath)) {
-    return {
+  return statusWithLiveness(
+    readJsonStatus(matcherStatusPath, {
       updatedAt: null,
       running: false,
       message: "自动撮合服务尚未写入状态",
-    };
-  }
-  return JSON.parse(fs.readFileSync(matcherStatusPath, "utf8"));
+    }),
+  );
 }
 
-export function bestPair(db) {
+export function matcherRiskEnabled() {
+  return String(
+    process.env.MATCHER_ENFORCE_RISK ??
+      (dbMode === "official-v2" ? "true" : "false"),
+  ).toLowerCase() === "true";
+}
+
+export function bestMatch(
+  db,
+  maxMakers = Number(process.env.MATCHER_MAX_MAKERS ?? "5"),
+  options = {},
+) {
+  const enforceRisk = options.enforceRisk ?? matcherRiskEnabled();
+  const riskClause = enforceRisk
+    ? `AND EXISTS (
+         SELECT 1 FROM order_reservations reservation
+         WHERE reservation.chain_id = orders.chain_id
+           AND reservation.local_order_id = orders.local_order_id
+           AND reservation.status = 'ACTIVE'
+           AND reservation.risk_status = 'COVERED'
+       )`
+    : "";
   const buys = db.prepare(
     `SELECT *
      FROM orders
      WHERE side = 'BUY'
        AND status IN ('OPEN', 'PARTIALLY_FILLED')
        AND signature IS NOT NULL
+       AND validation_status <> 'INVALID'
        AND (expiration = 0 OR expiration > CAST(strftime('%s','now') AS INTEGER))
        AND CAST(filled_maker_amount AS INTEGER) < CAST(maker_amount AS INTEGER)
        AND CAST(filled_taker_amount AS INTEGER) < CAST(taker_amount AS INTEGER)
+       ${riskClause}
      ORDER BY price_micros DESC, updated_at ASC`,
   ).all();
 
@@ -77,38 +122,68 @@ export function bestPair(db) {
      WHERE side = 'SELL'
        AND status IN ('OPEN', 'PARTIALLY_FILLED')
        AND signature IS NOT NULL
+       AND validation_status <> 'INVALID'
        AND (expiration = 0 OR expiration > CAST(strftime('%s','now') AS INTEGER))
        AND CAST(filled_maker_amount AS INTEGER) < CAST(maker_amount AS INTEGER)
        AND CAST(filled_taker_amount AS INTEGER) < CAST(taker_amount AS INTEGER)
        AND market_id = :marketId
        AND token_id = :tokenId
        AND price_micros <= :buyPriceMicros
+       ${riskClause}
      ORDER BY price_micros ASC, updated_at ASC
-     LIMIT 1`,
+     LIMIT :limit`,
   );
 
   for (const buy of buys) {
-    const sell = sellStatement.get({
+    const candidates = sellStatement.all({
       marketId: buy.market_id,
       tokenId: buy.token_id,
       buyPriceMicros: buy.price_micros,
+      limit: Math.max(1, Math.min(50, Number(maxMakers) || 5)),
     });
-    if (!sell) continue;
+    if (!candidates.length) continue;
 
-    if (
-      BigInt(buy.maker_amount) * BigInt(sell.maker_amount) <
-      BigInt(sell.taker_amount) * BigInt(buy.taker_amount)
-    ) {
-      continue;
+    let remainingBuyOutcome = remainingOutcome(buy);
+    let remainingBuyCollateral =
+      BigInt(buy.maker_amount) - BigInt(buy.filled_maker_amount ?? "0");
+    const makers = [];
+    for (const sell of candidates) {
+      if (
+        BigInt(buy.maker_amount) * BigInt(sell.maker_amount) <
+        BigInt(sell.taker_amount) * BigInt(buy.taker_amount)
+      ) {
+        continue;
+      }
+      let outcomeAmount =
+        remainingBuyOutcome < remainingOutcome(sell)
+          ? remainingBuyOutcome
+          : remainingOutcome(sell);
+      let collateralAmount = collateralForOutcome(sell, outcomeAmount);
+      if (collateralAmount > remainingBuyCollateral) {
+        outcomeAmount =
+          (remainingBuyCollateral * BigInt(sell.maker_amount)) /
+          BigInt(sell.taker_amount);
+        collateralAmount = collateralForOutcome(sell, outcomeAmount);
+      }
+      if (outcomeAmount <= 0n || collateralAmount <= 0n) continue;
+      makers.push({ sell, outcomeAmount, collateralAmount });
+      remainingBuyOutcome -= outcomeAmount;
+      remainingBuyCollateral -= collateralAmount;
+      if (remainingBuyOutcome === 0n || remainingBuyCollateral === 0n) break;
     }
-
-    return { buy, sell };
+    if (makers.length) return { buy, makers };
   }
 
   return {
     reason: "没有价格交叉且支付上限足够的 BUY/SELL 订单",
     bestBuy: buys[0],
   };
+}
+
+export function bestPair(db, options = {}) {
+  const match = bestMatch(db, 1, options);
+  if (match.reason) return match;
+  return { buy: match.buy, sell: match.makers[0].sell };
 }
 
 export function remainingOutcome(row) {
@@ -120,6 +195,28 @@ export function remainingOutcome(row) {
 
 export function collateralForOutcome(sell, outcomeAmount) {
   return (outcomeAmount * BigInt(sell.taker_amount)) / BigInt(sell.maker_amount);
+}
+
+export function feeForCashValue(cashValue, feeRateBps) {
+  const rate = BigInt(feeRateBps);
+  if (rate < 0n || rate >= 10_000n) {
+    throw new Error("MATCHER_FEE_RATE_BPS 必须在 0-9999 之间");
+  }
+  return (BigInt(cashValue) * rate) / 10_000n;
+}
+
+async function validateConfiguredFeeRate(publicClient, deployment, abi, feeRateBps) {
+  const maxFeeRateBps = await publicClient.readContract({
+    address: deployment.exchange,
+    abi,
+    functionName: "getMaxFeeRate",
+  });
+  if (BigInt(feeRateBps) > BigInt(maxFeeRateBps)) {
+    throw new Error(
+      `MATCHER_FEE_RATE_BPS=${feeRateBps} 超过链上上限 ${maxFeeRateBps}`,
+    );
+  }
+  return BigInt(maxFeeRateBps);
 }
 
 export function updateFill(db, row, makerFill, takerFill) {
@@ -143,6 +240,7 @@ export function updateFill(db, row, makerFill, takerFill) {
     filledMakerAmount: nextFilledMaker.toString(),
     filledTakerAmount: nextFilledTaker.toString(),
   });
+  syncOrderReservation(db, row.local_order_id, row.chain_id);
   return {
     status,
     filledMakerAmount: nextFilledMaker.toString(),
@@ -152,38 +250,123 @@ export function updateFill(db, row, makerFill, takerFill) {
 
 export async function matchOnce(options = {}) {
   const { dryRun = false, assertLiveAction = true } = options;
-  const deployment = loadDeployment();
+  const deployment = loadDeployment({ requireMarket: true });
+  const feeRateBps = Number(process.env.MATCHER_FEE_RATE_BPS ?? "0");
+  if (!Number.isInteger(feeRateBps) || feeRateBps < 0 || feeRateBps >= 10_000) {
+    throw new Error("MATCHER_FEE_RATE_BPS 必须是 0-9999 的整数");
+  }
   const db = openResearchDb();
   try {
-    const pair = bestPair(db);
-    if (pair.reason) {
+    const enforceRisk = matcherRiskEnabled();
+    const riskAudit = enforceRisk
+      ? await auditActiveReservations(db, deployment)
+      : null;
+    const match = bestMatch(db, undefined, { enforceRisk });
+    if (match.reason) {
       return {
         matched: false,
-        reason: pair.reason,
-        bestBuy: pair.bestBuy?.local_order_id,
+        reason: match.reason,
+        bestBuy: match.bestBuy?.local_order_id,
+        riskAudit,
       };
     }
 
-    const outcomeAmount = remainingOutcome(pair.buy) < remainingOutcome(pair.sell)
-      ? remainingOutcome(pair.buy)
-      : remainingOutcome(pair.sell);
-    const collateralAmount = collateralForOutcome(pair.sell, outcomeAmount);
+    const outcomeAmount = match.makers.reduce(
+      (total, maker) => total + maker.outcomeAmount,
+      0n,
+    );
+    const collateralAmount = match.makers.reduce(
+      (total, maker) => total + maker.collateralAmount,
+      0n,
+    );
+    const takerFeeAmount = feeForCashValue(collateralAmount, feeRateBps);
+    const makerFeeAmounts = match.makers.map(({ collateralAmount: cashValue }) =>
+      feeForCashValue(cashValue, feeRateBps),
+    );
     const summary = {
-      buyOrderId: pair.buy.local_order_id,
-      sellOrderId: pair.sell.local_order_id,
-      buyPriceMicros: pair.buy.price_micros,
-      sellPriceMicros: pair.sell.price_micros,
-      marketId: pair.buy.market_id,
-      tokenId: pair.buy.token_id,
+      buyOrderId: match.buy.local_order_id,
+      sellOrderIds: match.makers.map(({ sell }) => sell.local_order_id),
+      makerCount: match.makers.length,
+      buyPriceMicros: match.buy.price_micros,
+      sellPriceMicros: match.makers.map(({ sell }) => sell.price_micros),
+      marketId: match.buy.market_id,
+      tokenId: match.buy.token_id,
       outcomeAmount: outcomeAmount.toString(),
       collateralAmount: collateralAmount.toString(),
+      feeRateBps,
+      riskAudit,
+      takerFeeAmount: takerFeeAmount.toString(),
+      makerFeeAmounts: makerFeeAmounts.map((fee) => fee.toString()),
+      makerFills: match.makers.map(({ sell, outcomeAmount: outcome, collateralAmount: collateral }) => ({
+        sellOrderId: sell.local_order_id,
+        outcomeAmount: outcome.toString(),
+        collateralAmount: collateral.toString(),
+      })),
     };
 
     if (dryRun) {
+      const publicClient = createPublicClient({
+        chain: polygonAmoy,
+        transport: amoyTransport(),
+      });
+      const exchangeArtifact = readCurrentExchangeArtifact(deployment);
+      const maxFeeRateBps = await validateConfiguredFeeRate(
+        publicClient,
+        deployment,
+        exchangeArtifact.abi,
+        feeRateBps,
+      );
+      const validation = {};
+      for (const [side, row] of [
+        ["buy", match.buy],
+        ...match.makers.map(({ sell }, index) => [`sell-${index + 1}`, sell]),
+      ]) {
+        try {
+          await publicClient.readContract({
+            address: deployment.exchange,
+            abi: exchangeArtifact.abi,
+            functionName: "validateOrder",
+            args: [toContractOrder(row)],
+          });
+          validation[side] = { valid: true };
+        } catch (error) {
+          validation[side] = {
+            valid: false,
+            error: compactError(error),
+          };
+        }
+      }
+      let settlementSimulation;
+      try {
+        await publicClient.simulateContract({
+          account: account(),
+          address: deployment.exchange,
+          abi: exchangeArtifact.abi,
+          functionName: "matchOrders",
+          args: [
+            deployment.market.conditionId ?? deployment.market.marketId,
+            toContractOrder(match.buy),
+            match.makers.map(({ sell }) => toContractOrder(sell)),
+            collateralAmount,
+            match.makers.map(({ outcomeAmount: amount }) => amount),
+            takerFeeAmount,
+            makerFeeAmounts,
+          ],
+        });
+        settlementSimulation = { ready: true };
+      } catch (error) {
+        settlementSimulation = {
+          ready: false,
+          error: compactError(error),
+        };
+      }
       return {
         matched: false,
         dryRun: true,
         candidate: summary,
+        onchainOrderValidation: validation,
+        settlementSimulation,
+        onchainMaxFeeRateBps: maxFeeRateBps.toString(),
       };
     }
 
@@ -199,23 +382,41 @@ export async function matchOnce(options = {}) {
       chain: polygonAmoy,
       transport: amoyTransport(),
     });
-    const exchangeArtifact = readArtifact("ResearchCLOBExchange");
+    const exchangeArtifact = readCurrentExchangeArtifact(deployment);
+    const maxFeeRateBps = await validateConfiguredFeeRate(
+      publicClient,
+      deployment,
+      exchangeArtifact.abi,
+      feeRateBps,
+    );
 
-    const buyOrder = toContractOrder(pair.buy);
-    const sellOrder = toContractOrder(pair.sell);
-    const hash = await walletClient.writeContract({
+    const buyOrder = toContractOrder(match.buy);
+    const sellOrders = match.makers.map(({ sell }) => toContractOrder(sell));
+    const matchArgs = [
+      deployment.market.conditionId ?? deployment.market.marketId,
+      buyOrder,
+      sellOrders,
+      collateralAmount,
+      match.makers.map(({ outcomeAmount: amount }) => amount),
+      takerFeeAmount,
+      makerFeeAmounts,
+    ];
+    const { request } = await publicClient.simulateContract({
       account: signer,
-      chain: polygonAmoy,
       address: deployment.exchange,
       abi: exchangeArtifact.abi,
       functionName: "matchOrders",
-      args: [buyOrder, pair.buy.signature, sellOrder, pair.sell.signature, outcomeAmount],
+      args: matchArgs,
     });
+    const hash = await walletClient.writeContract(request);
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
     if (receipt.status !== "success") throw new Error(`撮合交易失败：${hash}`);
 
-    const buyFill = updateFill(db, pair.buy, collateralAmount, outcomeAmount);
-    const sellFill = updateFill(db, pair.sell, outcomeAmount, collateralAmount);
+    const buyFill = updateFill(db, match.buy, collateralAmount, outcomeAmount);
+    const sellFills = match.makers.map(({ sell, outcomeAmount: outcome, collateralAmount: collateral }) => ({
+      localOrderId: sell.local_order_id,
+      ...updateFill(db, sell, outcome, collateral),
+    }));
     upsert(
       db,
       `INSERT INTO trades(
@@ -239,14 +440,14 @@ export async function matchOnce(options = {}) {
       {
         chainId: Number(deployment.chainId),
         txHash: hash,
-        marketId: pair.buy.market_id,
-        buyer: pair.buy.maker,
-        seller: pair.sell.maker,
-        tokenId: pair.buy.token_id,
+        marketId: match.buy.market_id,
+        buyer: match.buy.maker,
+        seller: match.makers[0].sell.maker,
+        tokenId: match.buy.token_id,
         outcomeAmount: outcomeAmount.toString(),
         collateralAmount: collateralAmount.toString(),
-        buyOrderId: pair.buy.local_order_id,
-        sellOrderId: pair.sell.local_order_id,
+        buyOrderId: match.buy.local_order_id,
+        sellOrderId: match.makers[0].sell.local_order_id,
         rawJson: JSON.stringify({
           source: "matcher-core",
           ...summary,
@@ -263,7 +464,8 @@ export async function matchOnce(options = {}) {
       explorer: `https://amoy.polygonscan.com/tx/${hash}`,
       ...summary,
       buyFill,
-      sellFill,
+      sellFills,
+      onchainMaxFeeRateBps: maxFeeRateBps.toString(),
     };
   } finally {
     db.close();

@@ -1,6 +1,16 @@
 import { createPublicClient, fallback, formatUnits, http } from "viem";
 import { polygonAmoy } from "viem/chains";
-import { loadDeployment, openResearchDb, readArtifact, upsert } from "./order-utils.mjs";
+import {
+  loadDeployment,
+  openResearchDb,
+  readArtifact,
+  upsert,
+} from "./order-utils.mjs";
+import {
+  OFFICIAL_MODE,
+  erc20Abi,
+  erc1155Abi,
+} from "./exchange-config.mjs";
 
 function amoyRpcUrls() {
   const configured = process.env.AMOY_RPC_URLS || process.env.AMOY_RPC_URL;
@@ -17,7 +27,7 @@ function amoyRpcUrls() {
   ];
 }
 
-const deployment = loadDeployment();
+const deployment = loadDeployment({ requireMarket: true });
 const db = openResearchDb();
 const publicClient = createPublicClient({
   chain: polygonAmoy,
@@ -26,8 +36,14 @@ const publicClient = createPublicClient({
     { rank: false },
   ),
 });
-const walletCoinArtifact = readArtifact("ResearchWalletCoin");
-const outcomeArtifact = readArtifact("ResearchOutcomeToken");
+const collateralAbi =
+  deployment.mode === OFFICIAL_MODE
+    ? erc20Abi
+    : readArtifact("ResearchWalletCoin").abi;
+const outcomeAbi =
+  deployment.mode === OFFICIAL_MODE
+    ? erc1155Abi
+    : readArtifact("ResearchOutcomeToken").abi;
 const wallets = [
   ...new Set(
     db.prepare("SELECT wallet_address FROM wallets WHERE chain_id = ? ORDER BY wallet_role, wallet_address")
@@ -36,8 +52,14 @@ const wallets = [
       .filter(Boolean),
   ),
 ];
-if (!wallets.includes(deployment.buyerWallet)) wallets.push(deployment.buyerWallet);
-if (!wallets.includes(deployment.sellerWallet)) wallets.push(deployment.sellerWallet);
+for (const wallet of [deployment.buyerWallet, deployment.sellerWallet]) {
+  if (wallet && !wallets.includes(wallet)) wallets.push(wallet);
+}
+if (wallets.length === 0) {
+  throw new Error(
+    `${deployment.mode} 尚未配置可同步的钱包。请先运行 npm run db:import，或配置官方买卖钱包地址`,
+  );
+}
 
 const tokenRows = db.prepare(
   `SELECT yes_token_id, no_token_id
@@ -54,10 +76,15 @@ const tokenIds = [
   ),
 ];
 
+db.prepare(
+  `DELETE FROM token_balances
+   WHERE chain_id = ? AND token_id = '' AND token_symbol <> ?`,
+).run(Number(deployment.chainId), deployment.collateralSymbol);
+
 for (const wallet of wallets) {
   const walletCoinBalance = await publicClient.readContract({
-    address: deployment.walletCoin,
-    abi: walletCoinArtifact.abi,
+    address: deployment.collateral,
+    abi: collateralAbi,
     functionName: "balanceOf",
     args: [wallet],
   });
@@ -66,7 +93,7 @@ for (const wallet of wallets) {
     `INSERT INTO token_balances(
        chain_id, wallet_address, token_symbol, token_id, balance_decimal, source_tx, updated_at
      )
-     VALUES(:chainId, :walletAddress, 'rWALLET', '', :balanceDecimal, :sourceTx, CURRENT_TIMESTAMP)
+       VALUES(:chainId, :walletAddress, :tokenSymbol, '', :balanceDecimal, :sourceTx, CURRENT_TIMESTAMP)
      ON CONFLICT(chain_id, wallet_address, token_symbol, token_id) DO UPDATE SET
        balance_decimal=excluded.balance_decimal,
        source_tx=excluded.source_tx,
@@ -74,17 +101,18 @@ for (const wallet of wallets) {
     {
       chainId: Number(deployment.chainId),
       walletAddress: wallet,
-      balanceDecimal: formatUnits(walletCoinBalance, 6),
+      tokenSymbol: deployment.collateralSymbol,
+      balanceDecimal: formatUnits(walletCoinBalance, deployment.collateralDecimals),
       sourceTx: deployment.txs?.matchTx ?? null,
     },
   );
 
   for (const tokenId of tokenIds) {
     const balance = await publicClient.readContract({
-      address: deployment.outcomeToken,
-      abi: outcomeArtifact.abi,
+      address: deployment.ctf,
+      abi: outcomeAbi,
       functionName: "balanceOf",
-      args: [BigInt(tokenId), wallet],
+      args: [wallet, BigInt(tokenId)],
     });
     upsert(
       db,
@@ -101,7 +129,7 @@ for (const wallet of wallets) {
         walletAddress: wallet,
         tokenSymbol: tokenRows.some((row) => row.yes_token_id === tokenId) ? "YES" : "NO",
         tokenId,
-        balanceDecimal: formatUnits(balance, 6),
+        balanceDecimal: formatUnits(balance, deployment.collateralDecimals),
         sourceTx: deployment.txs?.matchTx ?? null,
       },
     );

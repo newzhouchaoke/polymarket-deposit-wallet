@@ -4,15 +4,142 @@ import { spawn } from "node:child_process";
 import { URL } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
-import { dbPath, initSchema, openDatabase, projectDir } from "./db.js";
+import { WebSocketServer } from "ws";
+import { getAddress, isHex } from "viem";
+import { dbMode, dbPath, initSchema, openDatabase, projectDir } from "./db.js";
 import { readMatcherStatus } from "./matcher-core.mjs";
+import { expireOrders, orderStats } from "./order-maintenance.mjs";
+import { orderHashFor, sideNumber } from "./order-utils.mjs";
+import { validateSignedOrder } from "./order-validation.mjs";
+import {
+  auditActiveReservations,
+  assertReservationCapacity,
+  readChainCapacity,
+  recordReservationRisk,
+  reservationSpec,
+  reservationSummary,
+  syncAllReservations,
+  syncOrderReservation,
+} from "./order-risk.mjs";
+import { officialModulesStatus } from "./official-modules-status.mjs";
+import { readJsonStatus, statusWithLiveness } from "./service-utils.mjs";
+import {
+  loadExchangeConfig,
+  runtimeSummary,
+} from "./exchange-config.mjs";
 
-const chainSyncStatusPath = path.join(projectDir, "data", "chain-sync-status.json");
+const chainSyncStatusPath = path.join(
+  projectDir,
+  "data",
+  `chain-sync-${dbMode}-status.json`,
+);
 
 const host = process.env.API_HOST ?? "127.0.0.1";
 const port = Number(process.env.API_PORT ?? "8787");
 const db = openDatabase();
 initSchema(db);
+const exchangeConfig = loadExchangeConfig();
+const exchangeRuntime = runtimeSummary(exchangeConfig);
+syncAllReservations(db);
+const writeToken = String(process.env.API_WRITE_TOKEN ?? "").trim();
+const readRateLimit = Number(process.env.API_READ_RATE_LIMIT_PER_MINUTE ?? "300");
+const writeRateLimit = Number(process.env.API_WRITE_RATE_LIMIT_PER_MINUTE ?? "30");
+const realtimePollMs = Number(process.env.API_REALTIME_POLL_MS ?? "2000");
+const healthRequireChainSync =
+  String(process.env.HEALTH_REQUIRE_CHAIN_SYNC ?? "true").toLowerCase() === "true";
+const requireSignedOrders =
+  String(
+    process.env.API_REQUIRE_SIGNED_ORDERS ??
+      (exchangeRuntime.mode === "official-v2" ? "true" : "false"),
+  ).toLowerCase() === "true";
+const validateSignedOrders =
+  String(process.env.API_VALIDATE_SIGNED_ORDERS ?? "true").toLowerCase() === "true";
+const enforceBalanceReservations =
+  String(
+    process.env.API_ENFORCE_BALANCE_RESERVATIONS ??
+      (exchangeRuntime.mode === "official-v2" ? "true" : "false"),
+  ).toLowerCase() === "true";
+const orderExpirySweepMs = Number(process.env.ORDER_EXPIRY_SWEEP_MS ?? "10000");
+const riskAuditIntervalMs = Number(
+  process.env.RISK_AUDIT_INTERVAL_MS ?? "30000",
+);
+const rateWindows = new Map();
+const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
+
+if (!loopbackHosts.has(host) && !writeToken) {
+  throw new Error(
+    "API 监听非本机地址时必须配置 API_WRITE_TOKEN，避免未授权链上写入",
+  );
+}
+if (!Number.isInteger(realtimePollMs) || realtimePollMs < 500) {
+  throw new Error("API_REALTIME_POLL_MS 必须是 >= 500 的整数毫秒");
+}
+if (!Number.isInteger(orderExpirySweepMs) || orderExpirySweepMs < 1000) {
+  throw new Error("ORDER_EXPIRY_SWEEP_MS 必须是 >= 1000 的整数毫秒");
+}
+if (!Number.isInteger(riskAuditIntervalMs) || riskAuditIntervalMs < 5000) {
+  throw new Error("RISK_AUDIT_INTERVAL_MS 必须是 >= 5000 的整数毫秒");
+}
+
+let riskAuditState = {
+  running: false,
+  enforced: enforceBalanceReservations,
+  intervalMs: riskAuditIntervalMs,
+  lastStartedAt: null,
+  lastFinishedAt: null,
+  lastResult: null,
+  lastError: null,
+};
+let riskAuditPromise = null;
+
+async function runRiskAudit(trigger = "manual") {
+  if (riskAuditPromise) return riskAuditPromise;
+  if (!enforceBalanceReservations) {
+    riskAuditState = {
+      ...riskAuditState,
+      running: false,
+      trigger,
+      lastStartedAt: new Date().toISOString(),
+      lastFinishedAt: new Date().toISOString(),
+      lastResult: {
+        skipped: true,
+        reason: "API_ENFORCE_BALANCE_RESERVATIONS=false",
+      },
+      lastError: null,
+    };
+    return riskAuditState;
+  }
+  riskAuditState = {
+    ...riskAuditState,
+    running: true,
+    lastStartedAt: new Date().toISOString(),
+    lastError: null,
+    trigger,
+  };
+  riskAuditPromise = auditActiveReservations(db, exchangeConfig)
+    .then((result) => {
+      riskAuditState = {
+        ...riskAuditState,
+        running: false,
+        lastFinishedAt: new Date().toISOString(),
+        lastResult: result,
+      };
+      return riskAuditState;
+    })
+    .catch((error) => {
+      riskAuditState = {
+        ...riskAuditState,
+        running: false,
+        lastFinishedAt: new Date().toISOString(),
+        lastError: error instanceof Error ? error.message : String(error),
+      };
+      throw error;
+    })
+    .finally(() => {
+      riskAuditPromise = null;
+    });
+  return riskAuditPromise;
+}
 
 function rows(sql, params = {}) {
   return db.prepare(sql).all(params).map(parseJsonColumns);
@@ -25,7 +152,7 @@ function one(sql, params = {}) {
 
 function parseJsonColumns(row) {
   const parsed = { ...row };
-  for (const key of ["raw_json", "args_json"]) {
+  for (const key of ["raw_json", "args_json", "details_json"]) {
     if (typeof parsed[key] === "string") {
       try {
         parsed[key] = JSON.parse(parsed[key]);
@@ -35,6 +162,100 @@ function parseJsonColumns(row) {
     }
   }
   return parsed;
+}
+
+function remoteAddress(req) {
+  return req.socket.remoteAddress ?? "unknown";
+}
+
+function consumeRateLimit(req, write) {
+  const maximum = write ? writeRateLimit : readRateLimit;
+  if (!Number.isInteger(maximum) || maximum < 1) {
+    throw new Error("API rate limit 必须是正整数");
+  }
+  const key = `${remoteAddress(req)}:${write ? "write" : "read"}`;
+  const now = Date.now();
+  const current = rateWindows.get(key);
+  const windowState =
+    !current || now - current.startedAt >= 60_000
+      ? { startedAt: now, count: 0 }
+      : current;
+  windowState.count += 1;
+  rateWindows.set(key, windowState);
+  return {
+    allowed: windowState.count <= maximum,
+    maximum,
+    remaining: Math.max(0, maximum - windowState.count),
+    resetAt: windowState.startedAt + 60_000,
+  };
+}
+
+function suppliedWriteToken(req) {
+  const authorization = String(req.headers.authorization ?? "");
+  if (/^Bearer\s+/i.test(authorization)) {
+    return authorization.replace(/^Bearer\s+/i, "").trim();
+  }
+  return String(req.headers["x-api-key"] ?? "").trim();
+}
+
+function secureEqual(left, right) {
+  const a = Buffer.from(left);
+  const b = Buffer.from(right);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function authorizeWrite(req) {
+  if (!writeToken) {
+    const address = remoteAddress(req);
+    if (
+      address === "127.0.0.1" ||
+      address === "::1" ||
+      address === "::ffff:127.0.0.1"
+    ) {
+      return "local";
+    }
+    throw Object.assign(new Error("未配置 API_WRITE_TOKEN，只允许本机写入"), {
+      statusCode: 401,
+    });
+  }
+  if (!secureEqual(suppliedWriteToken(req), writeToken)) {
+    throw Object.assign(new Error("缺少或无效的 API 写入令牌"), {
+      statusCode: 401,
+    });
+  }
+  return "token";
+}
+
+function auditAction(req, url, statusCode, action, actor, body = {}) {
+  const safeDetails = {
+    confirmation: body.confirmation ?? null,
+    outcome: body.outcome ?? null,
+    role: body.role ?? null,
+    localOrderId: body.localOrderId ?? null,
+    marketId: body.marketId ?? null,
+  };
+  const requestHash = crypto
+    .createHash("sha256")
+    .update(JSON.stringify(body))
+    .digest("hex");
+  db.prepare(
+    `INSERT INTO api_audit_log(
+       remote_address, method, path, action, actor, status_code,
+       request_hash, details_json
+     ) VALUES(
+       :remoteAddress, :method, :path, :action, :actor, :statusCode,
+       :requestHash, :detailsJson
+     )`,
+  ).run({
+    remoteAddress: remoteAddress(req),
+    method: req.method ?? "UNKNOWN",
+    path: url.pathname,
+    action,
+    actor,
+    statusCode,
+    requestHash,
+    detailsJson: JSON.stringify(safeDetails),
+  });
 }
 
 function json(res, status, data) {
@@ -50,6 +271,14 @@ function json(res, status, data) {
 function html(res, body) {
   res.writeHead(200, {
     "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  res.end(body);
+}
+
+function javascript(res, body) {
+  res.writeHead(200, {
+    "content-type": "text/javascript; charset=utf-8",
     "cache-control": "no-store",
   });
   res.end(body);
@@ -77,14 +306,13 @@ function internalError(res, error) {
 }
 
 function readChainSyncStatus() {
-  if (!fs.existsSync(chainSyncStatusPath)) {
-    return {
+  return statusWithLiveness(
+    readJsonStatus(chainSyncStatusPath, {
       updatedAt: null,
       running: false,
       message: "链上事件持续同步服务尚未写入状态",
-    };
-  }
-  return JSON.parse(fs.readFileSync(chainSyncStatusPath, "utf8"));
+    }),
+  );
 }
 
 function limit(url, fallback = 100) {
@@ -105,7 +333,7 @@ function readJsonBody(req) {
     req.on("data", (chunk) => {
       body += chunk.toString();
       if (body.length > 1_000_000) {
-        reject(new Error("Request body too large"));
+        reject(Object.assign(new Error("Request body too large"), { statusCode: 413 }));
         req.destroy();
       }
     });
@@ -117,7 +345,7 @@ function readJsonBody(req) {
       try {
         resolve(JSON.parse(body));
       } catch {
-        reject(new Error("Invalid JSON request body"));
+        reject(Object.assign(new Error("Invalid JSON request body"), { statusCode: 400 }));
       }
     });
     req.on("error", reject);
@@ -126,7 +354,7 @@ function readJsonBody(req) {
 
 function requireString(value, name) {
   if (typeof value !== "string" || value.trim() === "") {
-    throw new Error(`${name} is required`);
+    throw Object.assign(new Error(`${name} is required`), { statusCode: 400 });
   }
   return value.trim();
 }
@@ -134,7 +362,10 @@ function requireString(value, name) {
 function requireAmountString(value, name) {
   const text = requireString(String(value ?? ""), name);
   if (!/^\d+$/.test(text) || BigInt(text) <= 0n) {
-    throw new Error(`${name} must be a positive integer string`);
+    throw Object.assign(
+      new Error(`${name} must be a positive integer string`),
+      { statusCode: 400 },
+    );
   }
   return text;
 }
@@ -142,7 +373,7 @@ function requireAmountString(value, name) {
 function normalizeSide(value) {
   if (value === 0 || String(value).toUpperCase() === "BUY") return "BUY";
   if (value === 1 || String(value).toUpperCase() === "SELL") return "SELL";
-  throw new Error("side must be BUY or SELL");
+  throw Object.assign(new Error("side must be BUY or SELL"), { statusCode: 400 });
 }
 
 function priceMicrosForOrder(side, makerAmount, takerAmount) {
@@ -152,7 +383,9 @@ function priceMicrosForOrder(side, makerAmount, takerAmount) {
     ? (maker * 1_000_000n) / taker
     : (taker * 1_000_000n) / maker;
   if (price <= 0n || price >= 1_000_000n) {
-    throw new Error("price must be between 0 and 1");
+    throw Object.assign(new Error("price must be between 0 and 1"), {
+      statusCode: 400,
+    });
   }
   return Number(price);
 }
@@ -175,33 +408,101 @@ function localOrderId(order) {
   return `local-${crypto.createHash("sha256").update(raw).digest("hex")}`;
 }
 
-function insertOrder(order) {
+async function insertOrder(order) {
+  const marketId = requireString(order.marketId, "marketId");
   const market = one("SELECT * FROM markets WHERE market_id = :marketId", {
-    marketId: order.marketId,
+    marketId,
   });
-  if (!market) throw new Error(`Unknown marketId: ${order.marketId}`);
-  if (market.status !== "OPEN") throw new Error(`Market is not OPEN: ${market.status}`);
+  if (!market) {
+    throw Object.assign(new Error(`Unknown marketId: ${marketId}`), {
+      statusCode: 400,
+    });
+  }
+  if (market.status !== "OPEN") {
+    throw Object.assign(new Error(`Market is not OPEN: ${market.status}`), {
+      statusCode: 409,
+    });
+  }
 
   const side = normalizeSide(order.side);
   const makerAmount = requireAmountString(order.makerAmount, "makerAmount");
   const takerAmount = requireAmountString(order.takerAmount, "takerAmount");
+  let maker;
+  let signer;
+  try {
+    maker = getAddress(requireString(order.maker, "maker"));
+    signer = getAddress(requireString(order.signer ?? order.maker, "signer"));
+  } catch {
+    throw Object.assign(new Error("maker and signer must be valid EVM addresses"), {
+      statusCode: 400,
+    });
+  }
   const normalized = {
-    marketId: requireString(order.marketId, "marketId"),
-    maker: requireString(order.maker, "maker"),
-    signer: requireString(order.signer ?? order.maker, "signer"),
+    marketId,
+    maker,
+    signer,
     side,
     tokenId: requireString(order.tokenId ?? market.yes_token_id, "tokenId"),
     makerAmount,
     takerAmount,
     expiration: Number(order.expiration ?? 0),
     salt: String(order.salt ?? Date.now()),
+    signatureType: Number(order.signatureType ?? 3),
+    timestamp: String(order.timestamp ?? Math.floor(Date.now() / 1000)),
+    metadata: String(order.metadata ?? `0x${"00".repeat(32)}`),
+    builder: String(order.builder ?? `0x${"00".repeat(32)}`),
     signature: typeof order.signature === "string" ? order.signature : null,
     status: String(order.status ?? "OPEN").toUpperCase(),
     filledMakerAmount: String(order.filledMakerAmount ?? order.filled_maker_amount ?? "0"),
     filledTakerAmount: String(order.filledTakerAmount ?? order.filled_taker_amount ?? "0"),
   };
-  if (!["OPEN", "PARTIALLY_FILLED", "FILLED", "CANCELLED", "EXPIRED", "FAILED"].includes(normalized.status)) {
-    throw new Error("Invalid order status");
+  if (![market.yes_token_id, market.no_token_id].includes(normalized.tokenId)) {
+    throw Object.assign(new Error("tokenId does not belong to this market"), {
+      statusCode: 400,
+    });
+  }
+  if (!Number.isInteger(normalized.expiration) || normalized.expiration < 0) {
+    throw Object.assign(new Error("expiration must be a non-negative integer"), {
+      statusCode: 400,
+    });
+  }
+  if (normalized.expiration !== 0 && normalized.expiration <= Math.floor(Date.now() / 1000)) {
+    throw Object.assign(new Error("expiration must be zero or in the future"), {
+      statusCode: 400,
+    });
+  }
+  if (
+    !Number.isInteger(normalized.signatureType) ||
+    normalized.signatureType < 0 ||
+    normalized.signatureType > 3
+  ) {
+    throw Object.assign(new Error("signatureType must be 0, 1, 2, or 3"), {
+      statusCode: 400,
+    });
+  }
+  if (!/^\d+$/.test(normalized.salt) || !/^\d+$/.test(normalized.timestamp)) {
+    throw Object.assign(new Error("salt and timestamp must be uint256 strings"), {
+      statusCode: 400,
+    });
+  }
+  if (!/^0x[0-9a-fA-F]{64}$/.test(normalized.metadata)) {
+    throw Object.assign(new Error("metadata must be bytes32"), { statusCode: 400 });
+  }
+  if (!/^0x[0-9a-fA-F]{64}$/.test(normalized.builder)) {
+    throw Object.assign(new Error("builder must be bytes32"), { statusCode: 400 });
+  }
+  if (
+    normalized.signature !== null &&
+    (!isHex(normalized.signature) || normalized.signature.length % 2 !== 0)
+  ) {
+    throw Object.assign(new Error("signature must be an even-length hex value"), {
+      statusCode: 400,
+    });
+  }
+  if (normalized.status !== "OPEN") {
+    throw Object.assign(new Error("new API orders must start in OPEN status"), {
+      statusCode: 400,
+    });
   }
 
   const id = typeof order.localOrderId === "string" && order.localOrderId.trim()
@@ -209,43 +510,84 @@ function insertOrder(order) {
     : localOrderId(normalized);
   const priceMicros = priceMicrosForOrder(side, makerAmount, takerAmount);
   if (!/^\d+$/.test(normalized.filledMakerAmount) || !/^\d+$/.test(normalized.filledTakerAmount)) {
-    throw new Error("filled amounts must be integer strings");
+    throw Object.assign(new Error("filled amounts must be integer strings"), {
+      statusCode: 400,
+    });
+  }
+  if (normalized.filledMakerAmount !== "0" || normalized.filledTakerAmount !== "0") {
+    throw Object.assign(new Error("new API orders must have zero filled amounts"), {
+      statusCode: 400,
+    });
   }
   assertFillWithinOrder(
     { maker_amount: makerAmount, taker_amount: takerAmount },
     normalized.filledMakerAmount,
     normalized.filledTakerAmount,
   );
+  const contractOrder = {
+    salt: BigInt(normalized.salt),
+    maker: normalized.maker,
+    signer: normalized.signer,
+    tokenId: BigInt(normalized.tokenId),
+    makerAmount: BigInt(normalized.makerAmount),
+    takerAmount: BigInt(normalized.takerAmount),
+    side: sideNumber(normalized.side),
+    signatureType: normalized.signatureType,
+    timestamp: BigInt(normalized.timestamp),
+    metadata: normalized.metadata,
+    builder: normalized.builder,
+  };
+  const orderHash = orderHashFor(exchangeConfig, contractOrder);
+  normalized.orderHash = orderHash;
 
-  db.prepare(
-    `INSERT INTO orders(
-       chain_id, local_order_id, market_id, maker, signer, side, token_id,
-       maker_amount, taker_amount, filled_maker_amount, filled_taker_amount,
-       price_micros, status, expiration, salt, signature, raw_json, updated_at
-     )
-     VALUES(
-       :chainId, :localOrderId, :marketId, :maker, :signer, :side, :tokenId,
-       :makerAmount, :takerAmount, :filledMakerAmount, :filledTakerAmount,
-       :priceMicros, :status, :expiration, :salt, :signature, :rawJson, CURRENT_TIMESTAMP
-     )
-     ON CONFLICT(chain_id, local_order_id) DO UPDATE SET
-       market_id=excluded.market_id,
-       maker=excluded.maker,
-       signer=excluded.signer,
-       side=excluded.side,
-       token_id=excluded.token_id,
-       maker_amount=excluded.maker_amount,
-       taker_amount=excluded.taker_amount,
-       filled_maker_amount=excluded.filled_maker_amount,
-       filled_taker_amount=excluded.filled_taker_amount,
-       price_micros=excluded.price_micros,
-       status=excluded.status,
-       expiration=excluded.expiration,
-       salt=excluded.salt,
-       signature=excluded.signature,
-       raw_json=excluded.raw_json,
-       updated_at=excluded.updated_at`,
-  ).run({
+  const existingById = one(
+    "SELECT * FROM orders WHERE chain_id = :chainId AND local_order_id = :id",
+    { chainId: market.chain_id, id },
+  );
+  if (existingById) {
+    if (existingById.order_hash?.toLowerCase() === orderHash.toLowerCase()) {
+      return { ...existingById, idempotent: true };
+    }
+    throw Object.assign(
+      new Error(`localOrderId already belongs to a different order: ${id}`),
+      { statusCode: 409 },
+    );
+  }
+  const existingByHash = one(
+    `SELECT * FROM orders
+     WHERE chain_id = :chainId AND lower(order_hash) = lower(:orderHash)`,
+    { chainId: market.chain_id, orderHash },
+  );
+  if (existingByHash) return { ...existingByHash, idempotent: true };
+
+  if (requireSignedOrders && !normalized.signature) {
+    throw Object.assign(
+      new Error(
+        "official-v2 API requires a signed order; use the signed-order generator or provide signature",
+      ),
+      { statusCode: 400 },
+    );
+  }
+  let validation = {
+    status: normalized.signature ? "VALIDATION_SKIPPED" : "UNSIGNED",
+    error: null,
+    validatedAt: null,
+  };
+  if (normalized.signature && validateSignedOrders) {
+    validation = await validateSignedOrder(exchangeConfig, {
+      salt: normalized.salt,
+      maker: normalized.maker,
+      signer: normalized.signer,
+      token_id: normalized.tokenId,
+      maker_amount: normalized.makerAmount,
+      taker_amount: normalized.takerAmount,
+      side: normalized.side,
+      signature: normalized.signature,
+      raw_json: JSON.stringify(normalized),
+    });
+  }
+
+  const insertParams = {
     chainId: market.chain_id,
     localOrderId: id,
     marketId: normalized.marketId,
@@ -262,10 +604,98 @@ function insertOrder(order) {
     expiration: normalized.expiration,
     salt: normalized.salt,
     signature: normalized.signature,
+    orderHash,
+    validationStatus: validation.status,
+    validationError: validation.error,
+    validatedAt: validation.validatedAt,
     rawJson: JSON.stringify(normalized),
+  };
+  const candidateSpec = reservationSpec({
+    chain_id: market.chain_id,
+    local_order_id: id,
+    maker: normalized.maker,
+    side: normalized.side,
+    token_id: normalized.tokenId,
+    maker_amount: normalized.makerAmount,
+    filled_maker_amount: normalized.filledMakerAmount,
+    status: normalized.status,
   });
+  let chainRisk = null;
+  let chainCapacitySnapshot = null;
+  if (enforceBalanceReservations) {
+    try {
+      const chainCapacity = await readChainCapacity(exchangeConfig, candidateSpec);
+      chainCapacitySnapshot = chainCapacity;
+      chainRisk = {
+        ...assertReservationCapacity(db, candidateSpec, chainCapacity.capacity),
+        balance: chainCapacity.balance.toString(),
+        allowance: chainCapacity.allowance?.toString() ?? null,
+        approvedForAll: chainCapacity.approvedForAll,
+      };
+    } catch (error) {
+      if (error?.statusCode) throw error;
+      const wrapped = new Error(
+        `无法读取链上余额/授权，订单未进入订单簿：${
+          error instanceof Error ? error.message.split("\n")[0] : String(error)
+        }`,
+      );
+      wrapped.statusCode = 503;
+      wrapped.code = "RISK_CAPACITY_UNAVAILABLE";
+      throw wrapped;
+    }
+  }
 
-  return one("SELECT * FROM orders WHERE local_order_id = :id", { id });
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (enforceBalanceReservations) {
+      const capacity = BigInt(chainRisk.chainCapacity);
+      chainRisk = {
+        ...chainRisk,
+        ...assertReservationCapacity(db, candidateSpec, capacity),
+      };
+    }
+    db.prepare(
+      `INSERT INTO orders(
+         chain_id, local_order_id, market_id, maker, signer, side, token_id,
+         maker_amount, taker_amount, filled_maker_amount, filled_taker_amount,
+         price_micros, status, expiration, salt, signature, order_hash,
+         validation_status, validation_error, validated_at, raw_json, updated_at
+       )
+       VALUES(
+         :chainId, :localOrderId, :marketId, :maker, :signer, :side, :tokenId,
+         :makerAmount, :takerAmount, :filledMakerAmount, :filledTakerAmount,
+         :priceMicros, :status, :expiration, :salt, :signature, :orderHash,
+         :validationStatus, :validationError, :validatedAt, :rawJson, CURRENT_TIMESTAMP
+       )`,
+    ).run(insertParams);
+    syncOrderReservation(db, id, market.chain_id);
+    if (chainCapacitySnapshot) {
+      recordReservationRisk(
+        db,
+        id,
+        market.chain_id,
+        chainCapacitySnapshot,
+        "COVERED",
+      );
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+
+  return {
+    ...one("SELECT * FROM orders WHERE local_order_id = :id", { id }),
+    idempotent: false,
+    risk: {
+      enforced: enforceBalanceReservations,
+      ...(chainRisk ?? {
+        assetType: candidateSpec.assetType,
+        tokenId: candidateSpec.tokenId,
+        required: candidateSpec.reservedAmount.toString(),
+      }),
+    },
+  };
 }
 
 function orderById(localOrderId) {
@@ -275,14 +705,17 @@ function orderById(localOrderId) {
 function cancelOrder(localOrderId) {
   const order = orderById(localOrderId);
   if (!order) throw new Error(`Unknown order: ${localOrderId}`);
-  if (!["OPEN", "PARTIALLY_FILLED"].includes(order.status)) {
-    throw new Error(`Only OPEN/PARTIALLY_FILLED orders can be cancelled. Current: ${order.status}`);
+  if (!["OPEN", "PARTIALLY_FILLED", "USER_PAUSED"].includes(order.status)) {
+    throw new Error(
+      `Only OPEN/PARTIALLY_FILLED/USER_PAUSED orders can be cancelled. Current: ${order.status}`,
+    );
   }
   db.prepare(
     `UPDATE orders
      SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP
      WHERE local_order_id = :localOrderId`,
   ).run({ localOrderId });
+  syncOrderReservation(db, localOrderId, order.chain_id);
   return orderById(localOrderId);
 }
 
@@ -316,6 +749,7 @@ function fillOrder(localOrderId, body) {
     filledTakerAmount: nextFilledTaker,
     status: nextStatus,
   });
+  syncOrderReservation(db, localOrderId, order.chain_id);
   return orderById(localOrderId);
 }
 
@@ -372,6 +806,104 @@ async function cancelOrderOnchain(localOrderId, body = {}) {
   };
 }
 
+async function manageOfficialOrder(localOrderId, action, body = {}) {
+  if (exchangeRuntime.mode !== "official-v2") {
+    throw new Error("预批准管理只适用于 official-v2");
+  }
+  if (body.confirmation !== "AMOY_TESTNET_ONLY") {
+    throw new Error("链上预批准管理需要 confirmation=AMOY_TESTNET_ONLY");
+  }
+  const result = await runCommand(
+    "node",
+    ["scripts/manage-official-order.mjs", action, localOrderId],
+    {
+      cwd: new URL("..", import.meta.url).pathname,
+      env: {
+        ...process.env,
+        LIVE_ACTION: "MANAGE_OFFICIAL_ORDER",
+        LIVE_CONFIRMATION: "AMOY_TESTNET_ONLY",
+      },
+    },
+  );
+  return {
+    order: orderById(localOrderId),
+    stdout: result.stdout.trim(),
+    stderr: result.stderr.trim(),
+  };
+}
+
+async function manageOfficialUser(role, action, body = {}) {
+  if (exchangeRuntime.mode !== "official-v2") {
+    throw new Error("用户暂停只适用于 official-v2");
+  }
+  if (body.confirmation !== "AMOY_TESTNET_ONLY") {
+    throw new Error("用户暂停管理需要 confirmation=AMOY_TESTNET_ONLY");
+  }
+  const normalizedRole = String(role).toUpperCase();
+  if (!["BUYER", "SELLER"].includes(normalizedRole)) {
+    throw new Error("role 必须是 BUYER 或 SELLER");
+  }
+  const result = await runCommand(
+    "node",
+    ["scripts/manage-official-user.mjs", action, normalizedRole],
+    {
+      cwd: new URL("..", import.meta.url).pathname,
+      env: {
+        ...process.env,
+        LIVE_ACTION: "MANAGE_OFFICIAL_USER",
+        LIVE_CONFIRMATION: "AMOY_TESTNET_ONLY",
+      },
+    },
+  );
+  return {
+    role: normalizedRole,
+    action,
+    stdout: result.stdout.trim(),
+    stderr: result.stderr.trim(),
+  };
+}
+
+async function runMarketLifecycle(marketId, action, body = {}) {
+  if (exchangeRuntime.mode !== "official-v2") {
+    throw new Error("官方市场生命周期接口只适用于 official-v2");
+  }
+  if (marketId !== exchangeRuntime.marketId) {
+    throw new Error(`当前运行时未配置该市场：${marketId}`);
+  }
+  const args = ["scripts/official-market-lifecycle.mjs", action];
+  const env = { ...process.env };
+  if (action === "resolve") {
+    if (body.confirmation !== "AMOY_TESTNET_ONLY") {
+      throw new Error("链上结算需要 confirmation=AMOY_TESTNET_ONLY");
+    }
+    const outcome = String(body.outcome ?? "").toUpperCase();
+    if (!["YES", "NO"].includes(outcome)) throw new Error("outcome 必须是 YES 或 NO");
+    args.push(outcome);
+    env.LIVE_ACTION = "RESOLVE_OFFICIAL_MARKET";
+    env.LIVE_CONFIRMATION = "AMOY_TESTNET_ONLY";
+  } else if (action === "redeem") {
+    if (body.confirmation !== "AMOY_TESTNET_ONLY") {
+      throw new Error("链上赎回需要 confirmation=AMOY_TESTNET_ONLY");
+    }
+    const role = String(body.role ?? "").toUpperCase();
+    if (!["BUYER", "SELLER"].includes(role)) {
+      throw new Error("role 必须是 BUYER 或 SELLER");
+    }
+    args.push(role);
+    env.LIVE_ACTION = "REDEEM_OFFICIAL_MARKET";
+    env.LIVE_CONFIRMATION = "AMOY_TESTNET_ONLY";
+  }
+  const result = await runCommand("node", args, {
+    cwd: new URL("..", import.meta.url).pathname,
+    env,
+  });
+  return {
+    market: one("SELECT * FROM markets WHERE market_id = :marketId", { marketId }),
+    stdout: result.stdout.trim(),
+    stderr: result.stderr.trim(),
+  };
+}
+
 async function seedSignedOrders() {
   const result = await runCommand("node", ["scripts/seed-signed-orders.mjs"], {
     cwd: new URL("..", import.meta.url).pathname,
@@ -394,11 +926,11 @@ async function matchOrdersOnchain(body = {}) {
     throw new Error("链上撮合需要 confirmation=AMOY_TESTNET_ONLY");
   }
   const projectDir = new URL("..", import.meta.url).pathname;
-  const match = await runCommand("node", ["scripts/match-research-orders.mjs"], {
+  const match = await runCommand("node", ["scripts/match-orders.mjs"], {
     cwd: projectDir,
     env: {
       ...process.env,
-      LIVE_ACTION: "MATCH_RESEARCH_ORDERS",
+      LIVE_ACTION: "MATCH_ORDERS",
       LIVE_CONFIRMATION: "AMOY_TESTNET_ONLY",
     },
   });
@@ -454,9 +986,18 @@ function indexPage() {
     ["/api/wallets", "Deposit Wallet"],
     ["/api/markets", "市场"],
     ["/api/orders", "订单"],
+    ["/api/orders/stats", "订单状态与签名校验统计"],
+    ["/api/reservations", "活动订单资金预占"],
+    ["/api/risk/status", "持续资金风险巡检"],
     ["/api/markets/:id/orderbook", "指定市场订单簿"],
     ["/api/orderbook", "订单簿"],
     ["/api/trades", "成交"],
+    ["/api/order-fills", "逐订单链上成交"],
+    ["/api/audit", "API 写操作审计"],
+    ["/api/modules", "Standard / Neg Risk / UMA 状态"],
+    ["/api/health/live", "API 存活检查"],
+    ["/api/health/ready", "数据库/运行时/同步就绪检查"],
+    ["/api/metrics", "服务与数据库指标"],
     ["/api/balances", "余额"],
     ["/api/events", "链上事件"],
     ["/api/matcher/status", "自动撮合状态"],
@@ -468,7 +1009,7 @@ function indexPage() {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Research Polymarket API</title>
+  <title>Polymarket ${escapeHtml(exchangeRuntime.mode)} API</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 36px; color: #17212b; }
     h1 { color: #0d47a1; }
@@ -482,7 +1023,9 @@ function indexPage() {
   </style>
 </head>
 <body>
-  <h1>Research Polymarket 数据 API</h1>
+  <h1>Polymarket ${escapeHtml(exchangeRuntime.mode)} 数据 API</h1>
+  <p>运行模式：<code>${exchangeRuntime.mode}</code> · Exchange：
+    <code>${exchangeRuntime.exchange}</code></p>
   <p>数据库：<code>${dbPath}</code></p>
   <div class="grid">
     ${Object.entries(summary).map(([key, value]) => `<div class="card"><div>${key}</div><div class="count">${value}</div></div>`).join("")}
@@ -506,6 +1049,7 @@ function indexPage() {
 function tradePage() {
   const markets = routes["/api/markets"]();
   const wallets = routes["/api/wallets"]();
+  const officialRuntime = exchangeRuntime.mode === "official-v2";
   const market = markets[0];
   const buyer = wallets.find((wallet) => wallet.wallet_role === "buyer")?.wallet_address ?? "";
   const seller = wallets.find((wallet) => wallet.wallet_role === "seller")?.wallet_address ?? "";
@@ -518,7 +1062,7 @@ function tradePage() {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Research Polymarket 交易控制台</title>
+  <title>Polymarket ${escapeHtml(exchangeRuntime.mode)} 交易控制台</title>
   <style>
     :root { color-scheme: light; --blue:#1565c0; --deep:#0d47a1; --line:#dfe5ec; --muted:#667085; --bg:#f5f7fb; --danger:#b42318; --green:#1b5e20; --orange:#8a4b00; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: var(--bg); color: #17212b; }
@@ -574,13 +1118,15 @@ function tradePage() {
 </head>
 <body>
   <header>
-    <h1>Research Polymarket 交易页面</h1>
+    <h1>Polymarket ${escapeHtml(exchangeRuntime.mode)} 交易页面</h1>
+    <div>当前 Exchange：<span class="mono">${escapeHtml(exchangeRuntime.exchange)}</span></div>
     <div>市场、订单簿、签名订单、链上撮合、取消订单和余额监控。</div>
     <div class="topline">
       <a href="/dashboard">Dashboard</a>
       <a href="${escapeHtml(orderbookPath)}">订单簿 JSON</a>
       <a href="/api/matcher/status">撮合服务状态</a>
       <a href="/api/chain-sync/status">链上同步状态</a>
+      <a href="/api/risk/status">资金风险状态</a>
       <a href="/api/events?eventName=OrdersMatched">撮合事件</a>
       <a href="/api/events?eventName=OrderCancelled">取消事件</a>
     </div>
@@ -593,6 +1139,8 @@ function tradePage() {
     <div class="card"><div class="label">卖方钱包</div><div class="value mono" id="metric-seller">${escapeHtml(short(seller, 8))}</div></div>
     <div class="card"><div class="label">自动撮合</div><div class="value" id="metric-matcher">加载中</div></div>
     <div class="card"><div class="label">链上同步</div><div class="value" id="metric-chain-sync">加载中</div></div>
+    <div class="card"><div class="label">资金风险</div><div class="value" id="metric-risk">加载中</div></div>
+    <div class="card"><div class="label">实时推送</div><div class="value" id="metric-realtime">连接中</div></div>
   </section>
 
   <section class="layout">
@@ -602,19 +1150,67 @@ function tradePage() {
         <label>Market</label>
         <select id="market-select">${marketOptions}</select>
         <div class="status" id="market-info">加载市场信息...</div>
+        ${
+          officialRuntime
+            ? `<div class="topline">
+                <button id="market-close" type="button" class="secondary">关闭本地订单簿</button>
+                <button id="market-resolve-yes" type="button" class="warn">结算 YES</button>
+                <button id="market-resolve-no" type="button" class="warn">结算 NO</button>
+                <button id="market-redeem-buyer" type="button">买方赎回</button>
+                <button id="market-redeem-seller" type="button">卖方赎回</button>
+              </div>
+              <p class="muted small">关闭仅更新本地订单簿；结算调用 CTF reportPayouts，且不可逆。赎回调用 CtfCollateralAdapter。</p>`
+            : ""
+        }
         <div class="topline">
           <label><input id="auto-refresh" type="checkbox" checked style="width:auto" /> 自动刷新 5 秒</label>
         </div>
       </div>
 
       <div class="card">
+        <h2>MetaMask / 浏览器钱包</h2>
+        <p class="muted small">页面会通过 EIP-6963 明确选择 MetaMask，不使用 Phantom 注入的默认 Provider；连接后自动切换 Polygon Amoy。浏览器签名支持 EOA(0) 和官方 Proxy(1)。</p>
+        <button id="connect-wallet" type="button">连接 MetaMask</button>
+        <button id="refresh-wallet-assets" type="button" class="secondary">刷新余额/授权</button>
+        <button id="refresh-risk" type="button" class="secondary">执行资金巡检</button>
+        <div id="wallet-status" class="status">尚未连接钱包</div>
+        <pre id="wallet-assets">连接后显示账户 POL、Maker pUSD、结果代币余额和 Exchange 授权。</pre>
+      </div>
+
+      <div class="card">
         <h2>快捷操作</h2>
-        <p class="muted small">生成签名订单只写数据库；链上撮合/取消会发 Amoy 测试网交易。</p>
+        <p class="muted small">${
+          officialRuntime
+            ? "生成签名订单只写官方模式数据库；撮合会调用官方 V2 ABI，取消只作用于本地订单簿。"
+            : "生成签名订单只写数据库；链上撮合/取消会发 Amoy 测试网交易。"
+        }</p>
+        <label>API 写入令牌（仅在服务器配置 API_WRITE_TOKEN 时填写）</label>
+        <input id="api-write-token" type="password" autocomplete="off" placeholder="保存在当前浏览器 localStorage" />
+        <button id="save-api-token" type="button" class="secondary">保存令牌</button>
         <button id="seed-signed" type="button">生成签名订单</button>
         <button id="match-chain" type="button" class="warn">撮合一轮</button>
         <button id="sync-db" type="button" class="secondary">同步事件/余额</button>
         <div id="action-status" class="status">等待操作</div>
       </div>
+
+      ${
+        officialRuntime
+          ? `<div class="card">
+              <h2>官方 V2 Operator 预批准</h2>
+              <label>local_order_id</label>
+              <input id="preapproval-id" placeholder="点击订单行可自动填入" />
+              <button id="preapprove-order" type="button">链上预批准</button>
+              <button id="invalidate-order" type="button" class="warn">使预批准失效</button>
+              <p class="muted small">失效只撤销 Operator 的预批准，不会使原始用户签名失效；系统会同时本地取消该订单。</p>
+              <h3>用户级全部订单暂停</h3>
+              <button id="pause-buyer" type="button" class="warn">暂停 BUYER</button>
+              <button id="unpause-buyer" type="button">恢复 BUYER</button>
+              <button id="pause-seller" type="button" class="warn">暂停 SELLER</button>
+              <button id="unpause-seller" type="button">恢复 SELLER</button>
+              <p class="muted small">pauseUser 会阻止该 maker 的全部订单；不是单订单取消。</p>
+            </div>`
+          : ""
+      }
 
       <div class="card">
         <h2>提交订单到数据库</h2>
@@ -667,17 +1263,32 @@ function tradePage() {
               <input name="salt" value="${Date.now()}" />
             </div>
           </div>
-          <label>signature（可选；无签名订单不能链上撮合）</label>
+          <label>签名类型</label>
+          <select name="signatureType">
+            <option value="0">0 - EOA</option>
+            <option value="1" ${officialRuntime ? "selected" : ""}>1 - POLY_PROXY</option>
+            <option value="2">2 - POLY_GNOSIS_SAFE</option>
+            <option value="3" ${officialRuntime ? "" : "selected"}>3 - POLY_1271</option>
+          </select>
+          <label>signature（${officialRuntime ? "官方模式默认必填，入库前调用 validateOrder" : "可选；无签名订单不能链上撮合"}）</label>
           <input name="signature" value="" />
-          <button type="submit">提交订单</button>
+          <button type="submit">${officialRuntime ? "校验并提交签名订单" : "提交订单"}</button>
+          <button id="sign-submit-order" type="button">MetaMask 签名并提交</button>
         </form>
       </div>
 
       <div class="card">
-        <h2>链上取消订单</h2>
+        <h2>${officialRuntime ? "本地取消订单" : "链上取消订单"}</h2>
         <label>local_order_id</label>
         <input id="cancel-id" placeholder="点击订单行可自动填入" />
-        <button id="cancel-chain" type="button" class="warn">链上取消</button>
+        <button id="cancel-order" type="button" class="warn">${
+          officialRuntime ? "从本地订单簿取消" : "链上取消"
+        }</button>
+        ${
+          officialRuntime
+            ? '<p class="muted small">官方 V2 模式下此操作只更新本地订单簿，不调用研究合约的签名取消函数。</p>'
+            : ""
+        }
       </div>
     </div>
 
@@ -703,12 +1314,12 @@ function tradePage() {
 
       <div class="card section">
         <h2>最近订单</h2>
-        <div class="table-wrap"><table id="orders-table"><thead><tr><th>ID</th><th>方向</th><th>价格</th><th>成交进度</th><th>状态</th><th>签名</th><th>操作</th></tr></thead><tbody></tbody></table></div>
+        <div class="table-wrap"><table id="orders-table"><thead><tr><th>ID</th><th>方向</th><th>价格</th><th>成交进度</th><th>状态</th><th>签名</th><th>校验</th><th>操作</th></tr></thead><tbody></tbody></table></div>
       </div>
 
       <div class="card section">
         <h2>最近成交</h2>
-        <div class="table-wrap"><table id="trades-table"><thead><tr><th>Tx</th><th>Buyer</th><th>Seller</th><th class="right">YES/NO</th><th class="right">rWALLET</th></tr></thead><tbody></tbody></table></div>
+        <div class="table-wrap"><table id="trades-table"><thead><tr><th>Tx</th><th>Buyer</th><th>Seller</th><th class="right">YES/NO</th><th class="right">${escapeHtml(exchangeRuntime.collateralSymbol)}</th></tr></thead><tbody></tbody></table></div>
       </div>
 
       <div class="card section">
@@ -718,8 +1329,22 @@ function tradePage() {
     </div>
   </section>
   </main>
-  <script>
+  <script type="module">
+    import {
+      AMOY_CHAIN_HEX,
+      buildOrderForWallet,
+      connectWallet as connectBrowserWallet,
+      findMetaMaskProvider,
+      formatUnits,
+      isAmoyChainId,
+      normalizeChainId,
+      readWalletAssets,
+      signOrderTypedData,
+    } from "/assets/trade-wallet.js";
+
     const markets = ${JSON.stringify(markets)};
+    const runtimeMode = ${JSON.stringify(exchangeRuntime.mode)};
+    const runtime = ${JSON.stringify(exchangeRuntime)};
     const buyerWallet = "${escapeHtml(buyer)}";
     const sellerWallet = "${escapeHtml(seller)}";
     const form = document.querySelector("#order-form");
@@ -734,6 +1359,11 @@ function tradePage() {
     const balancesBody = document.querySelector("#balances-table tbody");
     const actionStatus = document.querySelector("#action-status");
     const actionButtons = Array.from(document.querySelectorAll("button"));
+    const walletStatus = document.querySelector("#wallet-status");
+    const walletAssets = document.querySelector("#wallet-assets");
+    let connectedAccount = null;
+    let activeWalletProvider = null;
+    let activeWalletInfo = null;
 
     function shortText(value, size = 8) {
       const text = String(value || "");
@@ -761,16 +1391,21 @@ function tradePage() {
       form.elements.tokenId.value = market.yes_token_id || "";
       form.elements.salt.value = String(Date.now());
       form.elements.signature.value = "";
+      const browserSignatureType = Number(form.elements.signatureType.value);
       if (side === "BUY") {
         form.elements.maker.value = buyerWallet;
-        form.elements.signer.value = buyerWallet;
+        form.elements.signer.value = connectedAccount || buyerWallet;
         form.elements.makerAmount.value = "600000";
         form.elements.takerAmount.value = "1000000";
       } else {
         form.elements.maker.value = sellerWallet;
-        form.elements.signer.value = sellerWallet;
+        form.elements.signer.value = connectedAccount || sellerWallet;
         form.elements.makerAmount.value = "1000000";
         form.elements.takerAmount.value = "560000";
+      }
+      if (connectedAccount && browserSignatureType === 0) {
+        form.elements.maker.value = connectedAccount;
+        form.elements.signer.value = connectedAccount;
       }
     }
 
@@ -789,9 +1424,12 @@ function tradePage() {
     }
 
     async function postJson(url, body = {}) {
+      const token = localStorage.getItem("polymarketApiWriteToken") || "";
+      const headers = { "content-type": "application/json" };
+      if (token) headers.authorization = "Bearer " + token;
       const response = await fetch(url, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers,
         body: JSON.stringify(body),
       });
       const json = await response.json();
@@ -799,24 +1437,217 @@ function tradePage() {
       return json;
     }
 
+    function updateConnectedAccount(account) {
+      connectedAccount = account || null;
+      walletStatus.className = "status";
+      walletStatus.textContent = connectedAccount
+        ? "已连接 " + (activeWalletInfo?.name || "MetaMask") +
+          " · Polygon Amoy (80002) · " + connectedAccount
+        : "尚未连接钱包";
+      if (!connectedAccount) return;
+      form.elements.signer.value = connectedAccount;
+      if (Number(form.elements.signatureType.value) === 0) {
+        form.elements.maker.value = connectedAccount;
+      }
+      form.elements.signature.value = "";
+    }
+
+    async function refreshBrowserWalletAssets() {
+      if (!connectedAccount) throw new Error("请先连接 MetaMask");
+      if (!activeWalletProvider) throw new Error("MetaMask Provider 尚未选择");
+      const maker = form.elements.maker.value.trim();
+      const tokenId = form.elements.tokenId.value;
+      const [snapshot, reservationState] = await Promise.all([
+        readWalletAssets(
+          activeWalletProvider,
+          runtime,
+          maker,
+          connectedAccount,
+          tokenId,
+        ),
+        fetch("/api/reservations?wallet=" + encodeURIComponent(maker))
+          .then(async (response) => {
+            const json = await response.json();
+            if (!response.ok) throw new Error(json.message || "读取预占失败");
+            return json;
+          }),
+      ]);
+      const collateralReservation = reservationState.totals.find(
+        (item) => item.assetType === "COLLATERAL",
+      );
+      const outcomeReservation = reservationState.totals.find(
+        (item) => item.assetType === "OUTCOME" && item.tokenId === tokenId,
+      );
+      const reservedCollateralRaw = BigInt(
+        collateralReservation?.reservedAmount || "0",
+      );
+      const reservedOutcomeRaw = BigInt(
+        outcomeReservation?.reservedAmount || "0",
+      );
+      const collateralBalanceRaw = BigInt(snapshot.makerCollateralRaw);
+      const collateralAllowanceRaw = BigInt(
+        snapshot.makerCollateralAllowanceRaw,
+      );
+      const collateralCapacityRaw =
+        collateralBalanceRaw < collateralAllowanceRaw
+          ? collateralBalanceRaw
+          : collateralAllowanceRaw;
+      const outcomeCapacityRaw = snapshot.outcomeApprovedForExchange
+        ? BigInt(snapshot.makerOutcomeRaw)
+        : 0n;
+      const remaining = (capacity, reserved) =>
+        capacity > reserved ? capacity - reserved : 0n;
+      const decimals = Number(runtime.collateralDecimals || 6);
+      walletAssets.textContent = JSON.stringify({
+        connectedAccount,
+        maker,
+        tokenId,
+        collateralSymbol: runtime.collateralSymbol,
+        ...snapshot,
+        reservations: {
+          collateral: formatUnits(reservedCollateralRaw, decimals),
+          selectedOutcome: formatUnits(reservedOutcomeRaw, decimals),
+          activeOrderCount: reservationState.reservations.length,
+        },
+        availableAfterReservations: {
+          collateral: formatUnits(
+            remaining(collateralCapacityRaw, reservedCollateralRaw),
+            decimals,
+          ),
+          selectedOutcome: formatUnits(
+            remaining(outcomeCapacityRaw, reservedOutcomeRaw),
+            decimals,
+          ),
+        },
+      }, null, 2);
+      return { ...snapshot, reservations: reservationState };
+    }
+
+    function handleWalletAccountsChanged(accounts) {
+      updateConnectedAccount(accounts?.[0] || null);
+      if (connectedAccount) {
+        refreshBrowserWalletAssets().catch((error) => {
+          walletAssets.textContent = String(error);
+        });
+      }
+    }
+
+    function handleWalletChainChanged(chainId) {
+      const onAmoy = isAmoyChainId(chainId);
+      const numericChainId = normalizeChainId(chainId);
+      walletStatus.className = onAmoy ? "status" : "status error";
+      walletStatus.textContent =
+        (activeWalletInfo?.name || "MetaMask") + " · " +
+        (connectedAccount ? connectedAccount + " · " : "") +
+        (onAmoy
+          ? "Polygon Amoy · chainId 80002"
+          : "当前 chainId " + (numericChainId ?? chainId) +
+            "，请点击“连接 MetaMask”切换到 Polygon Amoy (80002)");
+      form.elements.signature.value = "";
+    }
+
+    function bindWalletProvider(candidate) {
+      if (activeWalletProvider === candidate.provider) return;
+      activeWalletProvider?.removeListener?.(
+        "accountsChanged",
+        handleWalletAccountsChanged,
+      );
+      activeWalletProvider?.removeListener?.(
+        "chainChanged",
+        handleWalletChainChanged,
+      );
+      activeWalletProvider = candidate.provider;
+      activeWalletInfo = candidate.info;
+      activeWalletProvider.on?.("accountsChanged", handleWalletAccountsChanged);
+      activeWalletProvider.on?.("chainChanged", handleWalletChainChanged);
+    }
+
+    async function connectAndRefreshWallet() {
+      const candidate = await findMetaMaskProvider(window);
+      bindWalletProvider(candidate);
+      const account = await connectBrowserWallet(activeWalletProvider);
+      updateConnectedAccount(account);
+      await refreshBrowserWalletAssets();
+      return {
+        account,
+        chainId: AMOY_CHAIN_HEX,
+        message: "MetaMask 已连接 Polygon Amoy",
+      };
+    }
+
+    async function signAndSubmitBrowserOrder() {
+      if (!activeWalletProvider) {
+        const candidate = await findMetaMaskProvider(window);
+        bindWalletProvider(candidate);
+      }
+      if (!connectedAccount) {
+        updateConnectedAccount(
+          await connectBrowserWallet(activeWalletProvider),
+        );
+      }
+      const formValues = Object.fromEntries(new FormData(form).entries());
+      const { typedData, payload } = buildOrderForWallet(
+        runtime,
+        formValues,
+        connectedAccount,
+      );
+      const signature = await signOrderTypedData(
+        activeWalletProvider,
+        connectedAccount,
+        typedData,
+      );
+      form.elements.maker.value = payload.maker;
+      form.elements.signer.value = payload.signer;
+      form.elements.signature.value = signature;
+      const created = await postJson("/api/orders", {
+        ...payload,
+        signature,
+      });
+      return {
+        account: connectedAccount,
+        typedData,
+        created,
+      };
+    }
+
     async function refresh() {
       const market = activeMarket();
       const marketId = encodeURIComponent(market.market_id || "");
-      const [book, orders, trades, balances, matcher, chainSync] = await Promise.all([
+      const [book, orders, trades, balances, matcher, chainSync, risk, latestMarkets] = await Promise.all([
         fetch("/api/orderbook?marketId=" + marketId).then((r) => r.json()),
         fetch("/api/orders?marketId=" + marketId + "&limit=30").then((r) => r.json()),
         fetch("/api/trades?marketId=" + marketId + "&limit=20").then((r) => r.json()),
         fetch("/api/balances").then((r) => r.json()),
         fetch("/api/matcher/status").then((r) => r.json()),
         fetch("/api/chain-sync/status").then((r) => r.json()),
+        fetch("/api/risk/status").then((r) => r.json()),
+        fetch("/api/markets").then((r) => r.json()),
       ]);
+      const latestMarket = latestMarkets.find((item) => item.market_id === market.market_id);
+      if (latestMarket) Object.assign(market, latestMarket);
       document.querySelector("#metric-market").textContent = shortText(market.market_id || "无市场", 8);
       document.querySelector("#metric-matcher").textContent = matcher.running ? "运行中" : "未运行";
       document.querySelector("#metric-chain-sync").textContent = chainSync.running ? "运行中" : "未运行";
+      const riskResult = risk.lastResult || {};
+      document.querySelector("#metric-risk").textContent = risk.running
+        ? "巡检中"
+        : riskResult.checkFailed
+          ? "检查失败 " + riskResult.checkFailed
+          : riskResult.overcommitted
+            ? "超额 " + riskResult.overcommitted
+            : riskResult.skipped
+              ? "未启用"
+              : "正常";
       marketInfo.innerHTML = '<div><b>' + (market.question || "无市场") + '</b></div>'
         + '<div class="small muted">状态：' + (market.status || "-") + ' · YES ' + shortText(market.yes_token_id, 10) + ' · NO ' + shortText(market.no_token_id, 10) + '</div>'
         + '<div class="small muted">撮合状态：' + (matcher.mode || "-") + ' · 最近 ' + (matcher.updatedAt || "-") + '</div>'
         + '<div class="small muted">链上同步：' + (chainSync.running ? "运行中" : "未运行") + ' · 最近 ' + (chainSync.updatedAt || "-") + '</div>';
+      marketInfo.innerHTML += '<div class="small muted">资金巡检：'
+        + (risk.lastFinishedAt || "尚未完成")
+        + ' · covered=' + (riskResult.covered || 0)
+        + ' · overcommitted=' + (riskResult.overcommitted || 0)
+        + ' · failed=' + (riskResult.checkFailed || 0)
+        + '</div>';
 
       bidsBody.innerHTML = book.bids?.length ? book.bids.map((item) =>
         '<tr><td>' + item.price_micros + '</td><td class="right">' + item.total_size + '</td><td class="right">' + item.order_count + '</td></tr>'
@@ -828,11 +1659,16 @@ function tradePage() {
       ordersBody.innerHTML = orders.map((item) => {
         const filled = item.filled_maker_amount + "/" + item.maker_amount + " | " + item.filled_taker_amount + "/" + item.taker_amount;
         const signature = item.signature ? "yes" : "no";
-        const canCancel = (item.status === "OPEN" || item.status === "PARTIALLY_FILLED") && item.signature;
+        const validation = item.validation_status || "UNVERIFIED";
+        const canCancel = (
+          item.status === "OPEN" ||
+          item.status === "PARTIALLY_FILLED" ||
+          item.status === "USER_PAUSED"
+        ) && item.signature;
         const cancelButton = canCancel ? '<button class="mini warn cancel-row" data-id="' + item.local_order_id + '">取消</button>' : '';
         const copyButton = '<button class="mini secondary use-row" data-id="' + item.local_order_id + '">选中</button>';
-        return "<tr><td><code>" + item.local_order_id + "</code></td><td>" + sidePill(item.side) + "</td><td>" + item.price_micros + "</td><td>" + filled + "</td><td>" + statusPill(item.status) + "</td><td>" + signature + "</td><td class='nowrap'>" + copyButton + cancelButton + "</td></tr>";
-      }).join("") || emptyRow(7, "暂无订单");
+        return "<tr><td><code>" + item.local_order_id + "</code></td><td>" + sidePill(item.side) + "</td><td>" + item.price_micros + "</td><td>" + filled + "</td><td>" + statusPill(item.status) + "</td><td>" + signature + "</td><td>" + validation + "</td><td class='nowrap'>" + copyButton + cancelButton + "</td></tr>";
+      }).join("") || emptyRow(8, "暂无订单");
 
       tradesBody.innerHTML = trades.map((item) =>
         '<tr><td><a target="_blank" rel="noreferrer" href="https://amoy.polygonscan.com/tx/' + item.tx_hash + '">' + shortText(item.tx_hash, 8) + '</a></td><td class="mono">' + shortText(item.buyer, 8) + '</td><td class="mono">' + shortText(item.seller, 8) + '</td><td class="right">' + item.outcome_amount + '</td><td class="right">' + item.collateral_amount + '</td></tr>'
@@ -863,8 +1699,40 @@ function tradePage() {
       }
     }
 
+    document.querySelector("#connect-wallet").addEventListener("click", () => {
+      runAction("连接 MetaMask", connectAndRefreshWallet);
+    });
+    document.querySelector("#refresh-wallet-assets").addEventListener("click", () => {
+      runAction("读取钱包余额/授权", refreshBrowserWalletAssets);
+    });
+    document.querySelector("#refresh-risk").addEventListener("click", () => {
+      runAction("执行资金风险巡检", () => postJson("/api/risk/refresh"));
+    });
+    document.querySelector("#sign-submit-order").addEventListener("click", () => {
+      runAction("MetaMask EIP-712 签名并提交", signAndSubmitBrowserOrder);
+    });
+    form.elements.signatureType.addEventListener("change", () => {
+      form.elements.signature.value = "";
+      if (!connectedAccount) return;
+      const signatureType = Number(form.elements.signatureType.value);
+      form.elements.signer.value = connectedAccount;
+      if (signatureType === 0) {
+        form.elements.maker.value = connectedAccount;
+      } else if (signatureType === 1) {
+        form.elements.maker.value =
+          form.elements.side.value === "SELL" ? sellerWallet : buyerWallet;
+      }
+    });
     document.querySelector("#seed-signed").addEventListener("click", () => {
       runAction("生成签名订单", () => postJson("/api/orders/seed-signed"));
+    });
+    const apiTokenInput = document.querySelector("#api-write-token");
+    apiTokenInput.value = localStorage.getItem("polymarketApiWriteToken") || "";
+    document.querySelector("#save-api-token").addEventListener("click", () => {
+      const token = apiTokenInput.value.trim();
+      if (token) localStorage.setItem("polymarketApiWriteToken", token);
+      else localStorage.removeItem("polymarketApiWriteToken");
+      actionStatus.textContent = token ? "API 写入令牌已保存在当前浏览器" : "API 写入令牌已清除";
     });
     document.querySelector("#match-chain").addEventListener("click", () => {
       if (!confirm("确认在 Amoy 测试网上发起链上撮合交易？")) return;
@@ -873,9 +1741,78 @@ function tradePage() {
     document.querySelector("#sync-db").addEventListener("click", () => {
       runAction("同步事件/余额", () => postJson("/api/sync"));
     });
-    document.querySelector("#cancel-chain").addEventListener("click", () => {
+    if (runtimeMode === "official-v2") {
+      const marketAction = (action, body, label) => {
+        const market = activeMarket();
+        return runAction(
+          label,
+          () => postJson(
+            "/api/markets/" + encodeURIComponent(market.market_id) + "/" + action,
+            body,
+          ),
+        );
+      };
+      document.querySelector("#market-close").addEventListener("click", () => {
+        if (!confirm("关闭后，本地订单簿将不再接受新订单。确认关闭？")) return;
+        marketAction("close", {}, "关闭市场");
+      });
+      document.querySelector("#market-resolve-yes").addEventListener("click", () => {
+        if (!confirm("不可逆操作：确认在 Amoy 将结果结算为 YES？")) return;
+        marketAction("resolve", { outcome: "YES", confirmation: "AMOY_TESTNET_ONLY" }, "结算 YES");
+      });
+      document.querySelector("#market-resolve-no").addEventListener("click", () => {
+        if (!confirm("不可逆操作：确认在 Amoy 将结果结算为 NO？")) return;
+        marketAction("resolve", { outcome: "NO", confirmation: "AMOY_TESTNET_ONLY" }, "结算 NO");
+      });
+      for (const role of ["buyer", "seller"]) {
+        document.querySelector("#market-redeem-" + role).addEventListener("click", () => {
+          if (!confirm("确认让 " + role.toUpperCase() + " 在 Amoy 赎回胜出头寸？")) return;
+          marketAction(
+            "redeem",
+            { role: role.toUpperCase(), confirmation: "AMOY_TESTNET_ONLY" },
+            role.toUpperCase() + " 赎回",
+          );
+        });
+      }
+      document.querySelector("#preapprove-order").addEventListener("click", () => {
+        const id = document.querySelector("#preapproval-id").value.trim();
+        if (!id) return alert("请输入 local_order_id");
+        if (!confirm("确认由本测试 Exchange Operator 链上预批准该订单？")) return;
+        runAction("链上预批准", () => postJson(
+          "/api/orders/" + encodeURIComponent(id) + "/preapprove-chain",
+          { confirmation: "AMOY_TESTNET_ONLY" },
+        ));
+      });
+      document.querySelector("#invalidate-order").addEventListener("click", () => {
+        const id = document.querySelector("#preapproval-id").value.trim();
+        if (!id) return alert("请输入 local_order_id");
+        if (!confirm("确认撤销该订单的 Operator 预批准，并从本地订单簿取消？")) return;
+        runAction("预批准失效", () => postJson(
+          "/api/orders/" + encodeURIComponent(id) + "/invalidate-chain",
+          { confirmation: "AMOY_TESTNET_ONLY" },
+        ));
+      });
+      for (const role of ["buyer", "seller"]) {
+        for (const action of ["pause", "unpause"]) {
+          document.querySelector("#" + action + "-" + role).addEventListener("click", () => {
+            const verb = action === "pause" ? "暂停" : "恢复";
+            if (!confirm("确认在 Amoy " + verb + " " + role.toUpperCase() + " 的全部订单？")) return;
+            runAction(verb + " " + role.toUpperCase(), () => postJson(
+              "/api/users/" + role + "/" + action,
+              { confirmation: "AMOY_TESTNET_ONLY" },
+            ));
+          });
+        }
+      }
+    }
+    document.querySelector("#cancel-order").addEventListener("click", () => {
       const id = document.querySelector("#cancel-id").value.trim();
       if (!id) return alert("请输入 local_order_id");
+      if (runtimeMode === "official-v2") {
+        if (!confirm("确认从本地订单簿取消订单 " + id + "？")) return;
+        runAction("本地取消", () => postJson("/api/orders/" + encodeURIComponent(id) + "/cancel"));
+        return;
+      }
       if (!confirm("确认在 Amoy 测试网上链上取消订单 " + id + "？")) return;
       runAction("链上取消", () => postJson("/api/orders/" + encodeURIComponent(id) + "/cancel-chain", { confirmation: "AMOY_TESTNET_ONLY" }));
     });
@@ -884,6 +1821,12 @@ function tradePage() {
     marketSelect.addEventListener("change", () => {
       form.elements.marketId.value = activeMarket().market_id || "";
       setTokenFromKind();
+      if (realtimeSocket?.readyState === WebSocket.OPEN) {
+        realtimeSocket.send(JSON.stringify({
+          type: "subscribe",
+          marketId: activeMarket().market_id,
+        }));
+      }
       refresh().catch((error) => { result.textContent = String(error); });
     });
     tokenKind.addEventListener("change", setTokenFromKind);
@@ -891,8 +1834,10 @@ function tradePage() {
       const target = event.target;
       if (!target?.dataset?.id) return;
       document.querySelector("#cancel-id").value = target.dataset.id;
+      const preapprovalId = document.querySelector("#preapproval-id");
+      if (preapprovalId) preapprovalId.value = target.dataset.id;
       if (target.classList.contains("cancel-row")) {
-        document.querySelector("#cancel-chain").click();
+        document.querySelector("#cancel-order").click();
       }
     });
 
@@ -902,8 +1847,40 @@ function tradePage() {
       if (!data.signature) delete data.signature;
       runAction("提交数据库订单", () => postJson("/api/orders", data));
     });
+    let realtimeRefreshTimer;
+    let realtimeSocket;
+    function connectRealtime() {
+      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      const marketId = encodeURIComponent(activeMarket().market_id || "");
+      const socket = new WebSocket(protocol + "//" + location.host + "/ws?marketId=" + marketId);
+      realtimeSocket = socket;
+      socket.addEventListener("open", () => {
+        document.querySelector("#metric-realtime").textContent = "已连接";
+      });
+      socket.addEventListener("message", (event) => {
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type !== "snapshot") return;
+          document.querySelector("#metric-realtime").textContent = "实时";
+          clearTimeout(realtimeRefreshTimer);
+          realtimeRefreshTimer = setTimeout(() => {
+            refresh().catch((error) => { result.textContent = String(error); });
+          }, 100);
+        } catch {
+          document.querySelector("#metric-realtime").textContent = "消息错误";
+        }
+      });
+      socket.addEventListener("close", () => {
+        document.querySelector("#metric-realtime").textContent = "重连中";
+        setTimeout(connectRealtime, 2000);
+      });
+      socket.addEventListener("error", () => {
+        document.querySelector("#metric-realtime").textContent = "连接失败";
+      });
+    }
     setPreset("BUY");
     refresh().catch((error) => { result.textContent = String(error); });
+    connectRealtime();
     setInterval(() => {
       if (document.querySelector("#auto-refresh").checked) {
         refresh().catch((error) => { result.textContent = String(error); });
@@ -971,7 +1948,7 @@ function dashboardPage() {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Research Polymarket Dashboard</title>
+  <title>Polymarket ${escapeHtml(exchangeRuntime.mode)} Dashboard</title>
   <style>
     :root { color-scheme: light; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #f5f7fb; color: #17212b; }
@@ -1002,7 +1979,8 @@ function dashboardPage() {
 </head>
 <body>
   <header>
-    <h1>Research Polymarket Dashboard</h1>
+    <h1>Polymarket ${escapeHtml(exchangeRuntime.mode)} Dashboard</h1>
+    <div class="sub">当前 Exchange：<code>${escapeHtml(exchangeRuntime.exchange)}</code></div>
     <div class="sub">浏览 SQLite 数据库与 Amoy 链上同步事件</div>
     <div class="sub">数据库：<code>${escapeHtml(dbPath)}</code></div>
     <div class="nav">
@@ -1010,7 +1988,7 @@ function dashboardPage() {
       <a href="/api/summary">JSON 摘要</a>
       <a href="/trade">下单页面</a>
       <a href="/api/orderbook${firstMarketId ? `?marketId=${escapeHtml(firstMarketId)}` : ""}">订单簿 JSON</a>
-      <a href="/api/events?eventName=TradeExecuted">TradeExecuted JSON</a>
+      <a href="/api/events?eventName=OrdersMatched">OrdersMatched JSON</a>
       <a href="/api/matcher/status">自动撮合状态</a>
       <a href="https://amoy.polygonscan.com/" target="_blank" rel="noreferrer">Amoy Polygonscan</a>
     </div>
@@ -1141,15 +2119,130 @@ function orderbookForMarket(marketId) {
   return { marketId, activeStatuses, bids, asks };
 }
 
+function databaseHealth() {
+  try {
+    const result = db.prepare("PRAGMA quick_check").get();
+    return {
+      ok: result?.quick_check === "ok",
+      result: result?.quick_check ?? "unknown",
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      result: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function readiness() {
+  const database = databaseHealth();
+  const chainSync = readChainSyncStatus();
+  const activeReservations = one(
+    `SELECT COUNT(*) AS count FROM order_reservations
+     WHERE status = 'ACTIVE'`,
+  ).count;
+  const riskRequired =
+    enforceBalanceReservations && Number(activeReservations) > 0;
+  const riskResult = riskAuditState.lastResult;
+  const checks = {
+    database,
+    exchange: {
+      ok: Boolean(exchangeRuntime.exchange && exchangeRuntime.chainId === 80002),
+      mode: exchangeRuntime.mode,
+      chainId: exchangeRuntime.chainId,
+      address: exchangeRuntime.exchange,
+    },
+    market: {
+      ok: Boolean(exchangeRuntime.marketConfigured && exchangeRuntime.marketId),
+      marketId: exchangeRuntime.marketId,
+    },
+    chainSync: {
+      required: healthRequireChainSync,
+      ok: !healthRequireChainSync || chainSync.running,
+      running: chainSync.running,
+      processAlive: chainSync.processAlive,
+      stale: chainSync.stale,
+      updatedAt: chainSync.updatedAt,
+    },
+    riskAudit: {
+      required: riskRequired,
+      ok:
+        !riskRequired ||
+        (Boolean(riskResult) &&
+          Number(riskResult.checkFailed ?? 0) === 0 &&
+          !riskAuditState.lastError),
+      running: riskAuditState.running,
+      lastFinishedAt: riskAuditState.lastFinishedAt,
+      covered: Number(riskResult?.covered ?? 0),
+      overcommitted: Number(riskResult?.overcommitted ?? 0),
+      checkFailed: Number(riskResult?.checkFailed ?? 0),
+    },
+  };
+  return {
+    ok: Object.values(checks).every((check) => check.ok),
+    checkedAt: new Date().toISOString(),
+    checks,
+  };
+}
+
+function serviceMetrics() {
+  const memory = process.memoryUsage();
+  return {
+    generatedAt: new Date().toISOString(),
+    api: {
+      pid: process.pid,
+      uptimeSeconds: Math.floor(process.uptime()),
+      websocketClients: websocketServer.clients.size,
+      rateLimitBuckets: rateWindows.size,
+      memoryBytes: {
+        rss: memory.rss,
+        heapUsed: memory.heapUsed,
+        heapTotal: memory.heapTotal,
+      },
+    },
+    database: {
+      path: dbPath,
+      health: databaseHealth(),
+      orders: one("SELECT COUNT(*) AS count FROM orders").count,
+      openOrders: one(
+        `SELECT COUNT(*) AS count FROM orders
+         WHERE status IN ('OPEN', 'PARTIALLY_FILLED')`,
+      ).count,
+      activeReservations: one(
+        `SELECT COUNT(*) AS count FROM order_reservations
+         WHERE status = 'ACTIVE'`,
+      ).count,
+      trades: one("SELECT COUNT(*) AS count FROM trades").count,
+      chainEvents: one("SELECT COUNT(*) AS count FROM chain_events").count,
+      orderStats: orderStats(db),
+    },
+    riskAudit: riskAuditState,
+    matcher: readMatcherStatus(),
+    chainSync: readChainSyncStatus(),
+  };
+}
+
 const routes = {
+  "/api/health/live": () => ({
+    ok: true,
+    checkedAt: new Date().toISOString(),
+    pid: process.pid,
+    uptimeSeconds: Math.floor(process.uptime()),
+  }),
   "/api/summary": () => ({
     dbPath,
+    runtime: exchangeRuntime,
     counts: {
       contracts: one("SELECT COUNT(*) AS count FROM contracts").count,
       wallets: one("SELECT COUNT(*) AS count FROM wallets").count,
       markets: one("SELECT COUNT(*) AS count FROM markets").count,
       orders: one("SELECT COUNT(*) AS count FROM orders").count,
       trades: one("SELECT COUNT(*) AS count FROM trades").count,
+      orderFills: one("SELECT COUNT(*) AS count FROM order_fills").count,
+      activeReservations: one(
+        "SELECT COUNT(*) AS count FROM order_reservations WHERE status = 'ACTIVE'",
+      ).count,
+      apiAudit: one("SELECT COUNT(*) AS count FROM api_audit_log").count,
       tokenBalances: one("SELECT COUNT(*) AS count FROM token_balances").count,
       chainEvents: one("SELECT COUNT(*) AS count FROM chain_events").count,
     },
@@ -1185,6 +2278,21 @@ const routes = {
       params,
     );
   },
+  "/api/orders/stats": () => orderStats(db),
+  "/api/risk/status": () => ({
+    ...riskAuditState,
+    reservations: reservationSummary(db),
+  }),
+  "/api/reservations": (url) => {
+    const walletAddress = url.searchParams.get("wallet");
+    try {
+      return reservationSummary(db, walletAddress);
+    } catch {
+      throw Object.assign(new Error("wallet 必须是有效 EVM 地址"), {
+        statusCode: 400,
+      });
+    }
+  },
   "/api/orderbook": (url) => {
     const requestedMarketId = url.searchParams.get("marketId");
     const market = requestedMarketId
@@ -1211,6 +2319,33 @@ const routes = {
       params,
     );
   },
+  "/api/order-fills": (url) => {
+    const orderHash = url.searchParams.get("orderHash");
+    const localOrderId = url.searchParams.get("localOrderId");
+    const clauses = [];
+    const params = { limit: limit(url), offset: offset(url) };
+    if (orderHash) {
+      clauses.push("lower(order_hash) = lower(:orderHash)");
+      params.orderHash = orderHash;
+    }
+    if (localOrderId) {
+      clauses.push("local_order_id = :localOrderId");
+      params.localOrderId = localOrderId;
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    return rows(
+      `SELECT * FROM order_fills ${where}
+       ORDER BY block_number DESC, log_index DESC
+       LIMIT :limit OFFSET :offset`,
+      params,
+    );
+  },
+  "/api/audit": (url) =>
+    rows(
+      `SELECT * FROM api_audit_log
+       ORDER BY id DESC LIMIT :limit OFFSET :offset`,
+      { limit: limit(url), offset: offset(url) },
+    ),
   "/api/balances": (url) => {
     const wallet = url.searchParams.get("wallet");
     const symbol = url.searchParams.get("symbol");
@@ -1256,7 +2391,85 @@ const routes = {
   },
   "/api/matcher/status": () => readMatcherStatus(),
   "/api/chain-sync/status": () => readChainSyncStatus(),
+  "/api/metrics": () => serviceMetrics(),
 };
+
+const websocketServer = new WebSocketServer({ noServer: true });
+
+function realtimeSnapshot(marketId) {
+  const market = marketId
+    ? one("SELECT * FROM markets WHERE market_id = :marketId", { marketId })
+    : one("SELECT * FROM markets ORDER BY updated_at DESC LIMIT 1");
+  const selectedMarketId = market?.market_id ?? null;
+  return {
+    type: "snapshot",
+    generatedAt: new Date().toISOString(),
+    runtime: exchangeRuntime,
+    market,
+    orderbook: selectedMarketId
+      ? orderbookForMarket(selectedMarketId)
+      : { marketId: null, bids: [], asks: [] },
+    recentOrders: selectedMarketId
+      ? rows(
+          `SELECT local_order_id, order_hash, side, price_micros, status,
+                  filled_maker_amount, filled_taker_amount, updated_at
+           FROM orders
+           WHERE market_id = :marketId
+           ORDER BY updated_at DESC LIMIT 20`,
+          { marketId: selectedMarketId },
+        )
+      : [],
+    recentTrades: selectedMarketId
+      ? rows(
+          `SELECT * FROM trades
+           WHERE market_id = :marketId
+           ORDER BY created_at DESC LIMIT 20`,
+          { marketId: selectedMarketId },
+        )
+      : [],
+    riskAudit: riskAuditState,
+  };
+}
+
+function sendRealtime(socket, reason = "snapshot") {
+  if (socket.readyState !== 1) return;
+  socket.send(
+    JSON.stringify({
+      ...realtimeSnapshot(socket.marketId),
+      reason,
+    }),
+  );
+}
+
+function broadcastRealtime(reason) {
+  for (const socket of websocketServer.clients) {
+    sendRealtime(socket, reason);
+  }
+}
+
+websocketServer.on("connection", (socket, request) => {
+  const url = new URL(request.url ?? "/ws", `http://${request.headers.host ?? "localhost"}`);
+  socket.marketId = url.searchParams.get("marketId") ?? exchangeRuntime.marketId;
+  socket.isAlive = true;
+  socket.on("pong", () => {
+    socket.isAlive = true;
+  });
+  socket.on("message", (message) => {
+    try {
+      const parsed = JSON.parse(message.toString());
+      if (parsed.type === "subscribe" && typeof parsed.marketId === "string") {
+        socket.marketId = parsed.marketId;
+        sendRealtime(socket, "subscribed");
+      }
+    } catch {
+      socket.send(JSON.stringify({
+        type: "error",
+        message: "WebSocket 消息必须是 JSON",
+      }));
+    }
+  });
+  sendRealtime(socket, "connected");
+});
 
 function marketOrderbookPath(pathname) {
   const match = pathname.match(/^\/api\/markets\/(.+)\/orderbook$/);
@@ -1264,54 +2477,181 @@ function marketOrderbookPath(pathname) {
 }
 
 function orderActionPath(pathname) {
-  const match = pathname.match(/^\/api\/orders\/(.+)\/(cancel|fill|cancel-chain)$/);
+  const match = pathname.match(
+    /^\/api\/orders\/(.+)\/(cancel|fill|cancel-chain|preapprove-chain|invalidate-chain)$/,
+  );
   return match
     ? { localOrderId: decodeURIComponent(match[1]), action: match[2] }
     : null;
 }
 
+function marketActionPath(pathname) {
+  const match = pathname.match(/^\/api\/markets\/(.+)\/(close|resolve|redeem)$/);
+  return match
+    ? { marketId: decodeURIComponent(match[1]), action: match[2] }
+    : null;
+}
+
+function userActionPath(pathname) {
+  const match = pathname.match(/^\/api\/users\/(buyer|seller)\/(pause|unpause)$/i);
+  return match ? { role: match[1], action: match[2].toLowerCase() } : null;
+}
+
 const server = http.createServer(async (req, res) => {
+  let requestUrl;
+  let actor = "anonymous";
+  let requestBody = {};
+  let audited = false;
   try {
     if (!req.url) return badRequest(res, "Missing URL");
     const url = new URL(req.url, `http://${req.headers.host ?? `${host}:${port}`}`);
+    requestUrl = url;
 
     if (req.method === "OPTIONS") {
       res.writeHead(204, {
         "access-control-allow-origin": "*",
         "access-control-allow-methods": "GET, POST, OPTIONS",
-        "access-control-allow-headers": "content-type",
+        "access-control-allow-headers": "content-type, authorization, x-api-key",
       });
       res.end();
       return;
     }
 
+    const rate = consumeRateLimit(req, req.method === "POST");
+    if (!rate.allowed) {
+      res.setHeader("retry-after", String(Math.ceil((rate.resetAt - Date.now()) / 1000)));
+      return json(res, 429, {
+        error: "RATE_LIMITED",
+        message: `请求过于频繁，每分钟最多 ${rate.maximum} 次`,
+        resetAt: new Date(rate.resetAt).toISOString(),
+      });
+    }
+
     if (req.method === "POST") {
+      actor = authorizeWrite(req);
+      const respondAction = (statusCode, action, data) => {
+        auditAction(req, url, statusCode, action, actor, requestBody);
+        audited = true;
+        json(res, statusCode, data);
+        queueMicrotask(() => broadcastRealtime(action));
+      };
       if (url.pathname === "/api/orders/seed-signed") {
-        return json(res, 200, await seedSignedOrders());
+        return respondAction(200, "ORDER_SEED_SIGNED", await seedSignedOrders());
       }
       if (url.pathname === "/api/orders/match-chain") {
-        const body = await readJsonBody(req);
-        return json(res, 200, await matchOrdersOnchain(body));
+        requestBody = await readJsonBody(req);
+        return respondAction(
+          200,
+          "ORDER_MATCH_CHAIN",
+          await matchOrdersOnchain(requestBody),
+        );
       }
       if (url.pathname === "/api/sync") {
-        return json(res, 200, await syncDatabaseFromChain());
+        return respondAction(200, "DATABASE_SYNC", await syncDatabaseFromChain());
+      }
+      if (url.pathname === "/api/risk/refresh") {
+        return respondAction(
+          200,
+          "RISK_AUDIT_REFRESH",
+          await runRiskAudit("api"),
+        );
       }
       if (url.pathname === "/api/orders") {
-        const body = await readJsonBody(req);
-        return json(res, 201, insertOrder(body));
+        requestBody = await readJsonBody(req);
+        const result = await insertOrder(requestBody);
+        return respondAction(
+          result.idempotent ? 200 : 201,
+          result.idempotent ? "ORDER_CREATE_IDEMPOTENT" : "ORDER_CREATE",
+          result,
+        );
+      }
+      const marketAction = marketActionPath(url.pathname);
+      if (marketAction) {
+        requestBody = {
+          ...(await readJsonBody(req)),
+          marketId: marketAction.marketId,
+        };
+        return respondAction(
+          200,
+          `MARKET_${marketAction.action.toUpperCase()}`,
+          await runMarketLifecycle(
+            marketAction.marketId,
+            marketAction.action,
+            requestBody,
+          ),
+        );
+      }
+      const userAction = userActionPath(url.pathname);
+      if (userAction) {
+        requestBody = {
+          ...(await readJsonBody(req)),
+          role: userAction.role,
+        };
+        return respondAction(
+          200,
+          `USER_${userAction.action.toUpperCase()}`,
+          await manageOfficialUser(userAction.role, userAction.action, requestBody),
+        );
       }
       const action = orderActionPath(url.pathname);
       if (action?.action === "cancel") {
-        return json(res, 200, cancelOrder(action.localOrderId));
+        requestBody = { localOrderId: action.localOrderId };
+        return respondAction(200, "ORDER_CANCEL_LOCAL", cancelOrder(action.localOrderId));
       }
       if (action?.action === "fill") {
-        const body = await readJsonBody(req);
-        return json(res, 200, fillOrder(action.localOrderId, body));
+        requestBody = {
+          ...(await readJsonBody(req)),
+          localOrderId: action.localOrderId,
+        };
+        return respondAction(
+          200,
+          "ORDER_FILL_LOCAL",
+          fillOrder(action.localOrderId, requestBody),
+        );
       }
       if (action?.action === "cancel-chain") {
-        const body = await readJsonBody(req);
-        return json(res, 200, await cancelOrderOnchain(action.localOrderId, body));
+        requestBody = {
+          ...(await readJsonBody(req)),
+          localOrderId: action.localOrderId,
+        };
+        return respondAction(
+          200,
+          "ORDER_CANCEL_CHAIN",
+          await cancelOrderOnchain(action.localOrderId, requestBody),
+        );
       }
+      if (action?.action === "preapprove-chain") {
+        requestBody = {
+          ...(await readJsonBody(req)),
+          localOrderId: action.localOrderId,
+        };
+        return respondAction(
+          200,
+          "ORDER_PREAPPROVE",
+          await manageOfficialOrder(
+            action.localOrderId,
+            "preapprove",
+            requestBody,
+          ),
+        );
+      }
+      if (action?.action === "invalidate-chain") {
+        requestBody = {
+          ...(await readJsonBody(req)),
+          localOrderId: action.localOrderId,
+        };
+        return respondAction(
+          200,
+          "ORDER_PREAPPROVAL_INVALIDATE",
+          await manageOfficialOrder(
+            action.localOrderId,
+            "invalidate",
+            requestBody,
+          ),
+        );
+      }
+      auditAction(req, url, 404, "UNKNOWN_WRITE_ROUTE", actor, requestBody);
+      audited = true;
       return notFound(res, url.pathname);
     }
 
@@ -1319,6 +2659,15 @@ const server = http.createServer(async (req, res) => {
       return badRequest(res, "Only GET/POST is supported");
     }
 
+    if (url.pathname === "/assets/trade-wallet.js") {
+      return javascript(
+        res,
+        fs.readFileSync(
+          path.join(projectDir, "public", "trade-wallet.js"),
+          "utf8",
+        ),
+      );
+    }
     if (url.pathname === "/" || url.pathname === "/index.html") {
       return html(res, indexPage());
     }
@@ -1335,20 +2684,172 @@ const server = http.createServer(async (req, res) => {
     }
 
     const route = routes[url.pathname];
+    if (url.pathname === "/api/health/ready") {
+      const result = readiness();
+      return json(res, result.ok ? 200 : 503, result);
+    }
+    if (url.pathname === "/api/modules") {
+      return json(res, 200, await officialModulesStatus());
+    }
     if (!route) return notFound(res, url.pathname);
     return json(res, 200, route(url));
   } catch (error) {
+    const statusCode = Number(error?.statusCode ?? 500);
+    if (
+      req.method === "POST" &&
+      requestUrl &&
+      !audited
+    ) {
+      auditAction(
+        req,
+        requestUrl,
+        statusCode,
+        "WRITE_FAILED",
+        actor,
+        requestBody,
+      );
+    }
+    if (statusCode === 401) {
+      return json(res, 401, {
+        error: "UNAUTHORIZED",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+    if ([400, 409, 413, 422, 503].includes(statusCode)) {
+      const names = {
+        400: "BAD_REQUEST",
+        409: "CONFLICT",
+        413: "PAYLOAD_TOO_LARGE",
+        422: "ORDER_VALIDATION_FAILED",
+        503: "SERVICE_UNAVAILABLE",
+      };
+      return json(res, statusCode, {
+        error: error?.code ?? names[statusCode],
+        message: error instanceof Error ? error.message : String(error),
+        ...(error?.details ? { details: error.details } : {}),
+      });
+    }
     return internalError(res, error);
   }
 });
 
-server.listen(port, host, () => {
-  console.log(`Research Polymarket API 已启动：http://${host}:${port}`);
-  console.log(`数据库：${dbPath}`);
+server.on("upgrade", (request, socket, head) => {
+  try {
+    const url = new URL(
+      request.url ?? "/",
+      `http://${request.headers.host ?? `${host}:${port}`}`,
+    );
+    if (url.pathname !== "/ws") {
+      socket.destroy();
+      return;
+    }
+    websocketServer.handleUpgrade(request, socket, head, (websocket) => {
+      websocketServer.emit("connection", websocket, request);
+    });
+  } catch {
+    socket.destroy();
+  }
 });
 
+let realtimeFingerprint = "";
+function currentRealtimeFingerprint() {
+  const state = one(
+    `SELECT
+       (SELECT COUNT(*) FROM orders) AS order_count,
+       (SELECT COALESCE(MAX(updated_at), '') FROM orders) AS order_updated,
+       (SELECT COUNT(*) FROM trades) AS trade_count,
+       (SELECT COALESCE(MAX(created_at), '') FROM trades) AS trade_updated,
+       (SELECT COUNT(*) FROM chain_events) AS event_count,
+       (SELECT COALESCE(MAX(block_number), 0) FROM chain_events) AS event_block`,
+  );
+  return JSON.stringify(state);
+}
+const realtimePoll = setInterval(() => {
+  const next = currentRealtimeFingerprint();
+  if (realtimeFingerprint && next !== realtimeFingerprint) {
+    broadcastRealtime("database-updated");
+  }
+  realtimeFingerprint = next;
+}, realtimePollMs);
+realtimePoll.unref();
+
+const websocketHeartbeat = setInterval(() => {
+  for (const socket of websocketServer.clients) {
+    if (!socket.isAlive) {
+      socket.terminate();
+      continue;
+    }
+    socket.isAlive = false;
+    socket.ping();
+  }
+}, 30_000);
+websocketHeartbeat.unref();
+
+const rateLimitCleanup = setInterval(() => {
+  const cutoff = Date.now() - 60_000;
+  for (const [key, value] of rateWindows) {
+    if (value.startedAt < cutoff) rateWindows.delete(key);
+  }
+}, 60_000);
+rateLimitCleanup.unref();
+
+const orderExpirySweep = setInterval(() => {
+  try {
+    const changes = expireOrders(db);
+    if (changes > 0) broadcastRealtime("orders-expired");
+  } catch (error) {
+    console.error("[api] 订单过期维护失败：", error);
+  }
+}, orderExpirySweepMs);
+orderExpirySweep.unref();
+expireOrders(db);
+
+const riskAuditSweep = setInterval(() => {
+  runRiskAudit("interval")
+    .then(() => broadcastRealtime("risk-audit"))
+    .catch((error) => {
+      console.error("[api] 资金风险巡检失败：", error);
+    });
+}, riskAuditIntervalMs);
+riskAuditSweep.unref();
+
+server.listen(port, host, () => {
+  console.log(
+    `Polymarket ${exchangeRuntime.mode} API 已启动：http://${host}:${port}`,
+  );
+  console.log(`数据库：${dbPath}`);
+  runRiskAudit("startup")
+    .then(() => broadcastRealtime("risk-audit"))
+    .catch((error) => {
+      console.error("[api] 启动资金风险巡检失败：", error);
+    });
+});
+
+let shuttingDown = false;
 function shutdown() {
-  server.close(() => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearInterval(realtimePoll);
+  clearInterval(websocketHeartbeat);
+  clearInterval(rateLimitCleanup);
+  clearInterval(orderExpirySweep);
+  clearInterval(riskAuditSweep);
+  for (const socket of websocketServer.clients) socket.close(1001, "server shutdown");
+  websocketServer.close();
+  const forceExit = setTimeout(() => {
+    db.close();
+    process.exit(1);
+  }, 5_000);
+  forceExit.unref();
+  server.close(async () => {
+    clearTimeout(forceExit);
+    if (riskAuditPromise) {
+      try {
+        await riskAuditPromise;
+      } catch {
+        // The audit failure is already reflected in riskAuditState.
+      }
+    }
     db.close();
     process.exit(0);
   });

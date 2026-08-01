@@ -10,6 +10,8 @@ import {
   readArtifact,
   toContractOrder,
 } from "./order-utils.mjs";
+import { signErc7739TypedData } from "./erc7739.mjs";
+import { OFFICIAL_MODE } from "./exchange-config.mjs";
 
 function amoyRpcUrls() {
   const configured = process.env.AMOY_RPC_URLS || process.env.AMOY_RPC_URL;
@@ -51,6 +53,11 @@ function selectOrder(db, localOrderId) {
 
 const requestedId = process.argv[2] || process.env.ORDER_ID;
 const deployment = loadDeployment();
+if (deployment.mode === OFFICIAL_MODE) {
+  throw new Error(
+    "官方 CTF Exchange V2 没有研究版 cancelOrder(order,signature) 接口。请通过 POST /api/orders/:id/cancel 做链下取消；只有 preapproved 订单才能由 operator 调用 invalidatePreapprovedOrder。",
+  );
+}
 const db = openResearchDb();
 const row = selectOrder(db, requestedId);
 if (!row) {
@@ -90,13 +97,23 @@ const orderHash = await publicClient.readContract({
   functionName: "hashOrder",
   args: [order],
 });
-const cancelSignature = await walletClient.signTypedData({
+const cancelSignature = Number(order.signatureType) === 3
+  ? await signErc7739TypedData({
+      walletClient,
+      account: signer,
+      appDomain: domainFor(deployment),
+      contentsTypes: CANCEL_TYPES,
+      primaryType: "Cancel",
+      contents: { orderHash },
+      depositWallet: order.maker,
+    })
+  : await walletClient.signTypedData({
   account: signer,
   domain: domainFor(deployment),
   types: CANCEL_TYPES,
   primaryType: "Cancel",
   message: { orderHash },
-});
+  });
 
 const txHash = await walletClient.writeContract({
   account: signer,

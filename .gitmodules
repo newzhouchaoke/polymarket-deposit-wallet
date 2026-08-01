@@ -1,0 +1,12 @@
+[submodule "official/ctf-exchange-v2"]
+	path = official/ctf-exchange-v2
+	url = https://github.com/Polymarket/ctf-exchange-v2.git
+[submodule "official/neg-risk-ctf-adapter"]
+	path = official/neg-risk-ctf-adapter
+	url = https://github.com/Polymarket/neg-risk-ctf-adapter.git
+[submodule "official/uma-ctf-adapter"]
+	path = official/uma-ctf-adapter
+	url = https://github.com/Polymarket/uma-ctf-adapter.git
+[submodule "official/proxy-factories"]
+	path = official/proxy-factories
+	url = https://github.com/Polymarket/proxy-factories.git

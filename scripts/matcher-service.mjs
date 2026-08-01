@@ -1,16 +1,24 @@
 import { spawn } from "node:child_process";
 import { matchOnce, readMatcherStatus, writeMatcherStatus } from "./matcher-core.mjs";
+import {
+  backoffDelayMs,
+  createInterruptibleSleeper,
+} from "./service-utils.mjs";
 
 const intervalMs = Number(process.env.MATCHER_INTERVAL_MS ?? "15000");
 const maxMatchesPerTick = Number(process.env.MATCHER_MAX_PER_TICK ?? "3");
 const dryRun = process.argv.includes("--dry-run") || process.env.MATCHER_DRY_RUN === "true";
 const once = process.argv.includes("--once");
+const maxBackoffMs = Number(process.env.MATCHER_MAX_BACKOFF_MS ?? "120000");
 
 if (!Number.isInteger(intervalMs) || intervalMs < 3000) {
   throw new Error("MATCHER_INTERVAL_MS 必须是 >= 3000 的整数毫秒");
 }
 if (!Number.isInteger(maxMatchesPerTick) || maxMatchesPerTick < 1 || maxMatchesPerTick > 20) {
   throw new Error("MATCHER_MAX_PER_TICK 必须是 1-20 的整数");
+}
+if (!Number.isInteger(maxBackoffMs) || maxBackoffMs < intervalMs) {
+  throw new Error("MATCHER_MAX_BACKOFF_MS 必须是 >= MATCHER_INTERVAL_MS 的整数毫秒");
 }
 
 function runCommand(command, args) {
@@ -74,29 +82,44 @@ async function runTick() {
     lastNoMatch,
     lastSync,
   };
-  writeMatcherStatus(status);
   return status;
 }
 
 let stopped = false;
+let consecutiveErrors = 0;
+const sleeper = createInterruptibleSleeper();
 
 async function loop() {
   while (!stopped) {
+    let delayMs = intervalMs;
     try {
       const status = await runTick();
+      consecutiveErrors = 0;
       const message = status.matchedCount
         ? `本轮撮合 ${status.matchedCount} 笔`
         : status.lastNoMatch?.dryRun
           ? `dry-run 发现候选订单：${status.lastNoMatch.candidate?.buyOrderId} / ${status.lastNoMatch.candidate?.sellOrderId}`
           : `本轮无成交：${status.lastNoMatch?.reason ?? "unknown"}`;
       console.log(`[matcher] ${new Date().toISOString()} ${message}`);
+      writeMatcherStatus({
+        ...status,
+        pid: process.pid,
+        consecutiveErrors,
+        lastSuccessAt: new Date().toISOString(),
+      });
       if (once) break;
     } catch (error) {
+      consecutiveErrors += 1;
+      delayMs = backoffDelayMs(consecutiveErrors, intervalMs, maxBackoffMs);
       const previous = readMatcherStatus();
       writeMatcherStatus({
         ...previous,
         running: !once,
+        pid: process.pid,
         mode: dryRun ? "dry-run" : "live-amoy",
+        consecutiveErrors,
+        retryDelayMs: delayMs,
+        nextRetryAt: once ? null : new Date(Date.now() + delayMs).toISOString(),
         errorAt: new Date().toISOString(),
         error: error instanceof Error ? error.message : String(error),
       });
@@ -106,7 +129,7 @@ async function loop() {
         break;
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    if (!once && !stopped) await sleeper.sleep(delayMs);
   }
   const previous = readMatcherStatus();
   writeMatcherStatus({
@@ -128,9 +151,11 @@ writeMatcherStatus({
 
 process.on("SIGINT", () => {
   stopped = true;
+  sleeper.wake();
 });
 process.on("SIGTERM", () => {
   stopped = true;
+  sleeper.wake();
 });
 
 await loop();

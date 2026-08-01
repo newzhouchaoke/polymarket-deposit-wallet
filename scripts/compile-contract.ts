@@ -14,21 +14,38 @@ const artifactContractNames = [
   "ResearchOutcomeToken",
   "ResearchMarketRegistry",
   "ResearchDepositWallet",
+  "ResearchUpgradeableBeacon",
+  "ResearchBeaconProxy",
   "ResearchDepositWalletFactory",
   "ResearchCLOBExchange",
 ];
-const sourceFileNames = fs
-  .readdirSync(path.resolve(PROJECT_DIR, "contracts"))
-  .filter((fileName) => fileName.endsWith(".sol"));
+const contractsRoot = path.resolve(PROJECT_DIR, "contracts");
+
+function findSoliditySources(
+  directory: string,
+): Array<{ sourceName: string; filePath: string }> {
+  const sources: Array<{ sourceName: string; filePath: string }> = [];
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const filePath = path.resolve(directory, entry.name);
+    if (entry.isDirectory()) {
+      sources.push(...findSoliditySources(filePath));
+    } else if (entry.isFile() && entry.name.endsWith(".sol")) {
+      sources.push({
+        sourceName: path.relative(contractsRoot, filePath).split(path.sep).join("/"),
+        filePath,
+      });
+    }
+  }
+  return sources;
+}
+
+const sourceFiles = findSoliditySources(contractsRoot);
 const sources = Object.fromEntries(
-  sourceFileNames.map((fileName) => {
+  sourceFiles.map(({ sourceName, filePath }) => {
     return [
-      fileName,
+      sourceName,
       {
-        content: fs.readFileSync(
-          path.resolve(PROJECT_DIR, "contracts", fileName),
-          "utf8",
-        ),
+        content: fs.readFileSync(filePath, "utf8"),
       },
     ];
   }),
@@ -39,13 +56,39 @@ const input = {
   settings: {
     optimizer: { enabled: true, runs: 200 },
     viaIR: true,
+    evmVersion: "shanghai",
     outputSelection: {
       "*": { "*": ["abi", "evm.bytecode.object"] },
     },
   },
 };
 
-const output = JSON.parse(solc.compile(JSON.stringify(input)));
+const soladyRoot = path.resolve(
+  PROJECT_DIR,
+  "official",
+  "ctf-exchange-v2",
+  "lib",
+  "solady",
+);
+
+function resolveImport(importPath: string): { contents?: string; error?: string } {
+  if (!importPath.startsWith("@solady/")) {
+    return { error: `不允许的 Solidity import：${importPath}` };
+  }
+  const relativePath = importPath.slice("@solady/".length);
+  const resolvedPath = path.resolve(soladyRoot, relativePath);
+  if (
+    !resolvedPath.startsWith(`${soladyRoot}${path.sep}`) ||
+    !fs.existsSync(resolvedPath)
+  ) {
+    return { error: `找不到 Solidity import：${importPath}` };
+  }
+  return { contents: fs.readFileSync(resolvedPath, "utf8") };
+}
+
+const output = JSON.parse(
+  solc.compile(JSON.stringify(input), { import: resolveImport }),
+);
 const errors = (output.errors ?? []) as Array<{
   severity: string;
   formattedMessage: string;

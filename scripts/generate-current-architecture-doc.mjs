@@ -8,7 +8,10 @@ import { dbPath, initSchema, openDatabase, projectDir } from "./db.js";
 const docsDir = path.join(projectDir, "docs");
 const outputName = "Polymarket_真实交易研究系统_当前完整架构说明.docx";
 const outputPath = path.join(docsDir, outputName);
-const deploymentPath = path.join(projectDir, "deployments", "research-official-like-amoy.json");
+const v2DeploymentPath = path.join(projectDir, "deployments", "research-v2-amoy.json");
+const deploymentPath = fs.existsSync(v2DeploymentPath)
+  ? v2DeploymentPath
+  : path.join(projectDir, "deployments", "research-official-like-amoy.json");
 const buildDir = fs.mkdtempSync(path.join(os.tmpdir(), "current-architecture-docx-"));
 
 const deployment = fs.existsSync(deploymentPath)
@@ -208,13 +211,13 @@ body.push(
   table(
     ["模块", "当前状态", "说明"],
     [
-      ["智能钱包", "已完成", "ResearchDepositWallet + Factory，CREATE2 派生，owner 控制，ERC-1271 验签"],
-      ["资产", "已完成", "ResearchWalletCoin/rWALLET 作为抵押币；ResearchOutcomeToken 作为 YES/NO 份额"],
+      ["智能钱包", "已完成", "CREATE2 + ERC-1967 BeaconProxy；EIP-712 Batch、nonce/deadline、ERC-1271"],
+      ["资产", "已完成", "rWALLET 抵押币；标准 ERC-1155 调用方式；CTF split/merge/redeem"],
       ["市场生命周期", "已完成基础版", "Market 存储与 OPEN/CLOSED/RESOLVED 状态；前端控制还可继续增强"],
       ["订单簿", "已完成", "SQLite 保存订单、状态、签名、成交数量；API 可查询 orderbook"],
       ["签名订单", "已完成", "EIP-712 Order，signer 为 Deposit Wallet，owner 签名，链上 ERC-1271 验证"],
-      ["链上撮合", "已完成", "ResearchCLOBExchange 支持全量成交与部分成交"],
-      ["链上取消", "已完成", "EIP-712 Cancel(orderHash)，链上写 cancelled，事件同步回数据库"],
+      ["链上撮合", "已完成", "V2 风格一对多 matchOrders；COMPLEMENTARY、MINT、MERGE"],
+      ["链上取消", "研究扩展", "EIP-712 Cancel(orderHash)，OrderStatus 标记 filled"],
       ["前端控制台", "已完成基础版", "/trade 支持生成签名订单、链上撮合、链上取消、同步、订单簿查看"],
       ["事件与余额同步", "已完成", "OrdersMatched、OrderCancelled、Transfer、Approval 等事件入库；余额链上读取"],
     ],
@@ -236,9 +239,9 @@ body.push(
       ["API 服务", "scripts/api-server.mjs", "提供 /api/orders、/api/orderbook、/api/events、/api/sync 等接口"],
       ["数据库", "SQLite research-polymarket.sqlite", "保存 markets、orders、trades、balances、chain_events、chain_actions"],
       ["脚本层", "seed/match/cancel/sync/deploy 脚本", "生成签名、部署合约、撮合、取消、同步事件和余额"],
-      ["钱包层", "ResearchDepositWallet", "持有资产、执行授权、ERC-1271 验证 owner 签名"],
-      ["交易层", "ResearchCLOBExchange", "验证订单、处理部分成交、取消订单、原子结算 rWALLET 与 YES"],
-      ["资产层", "ResearchWalletCoin / ResearchOutcomeToken", "模拟抵押币和结果份额"],
+      ["钱包层", "DepositWallet + Beacon + Proxy + Factory", "确定性钱包、签名 Batch、session signer、ERC-1271"],
+      ["交易层", "ResearchCLOBExchange", "V2 订单、operator 一对多撮合、费用、暂停、三种结算"],
+      ["资产层", "ResearchWalletCoin / ResearchOutcomeToken", "抵押币与可 split/merge/redeem 的 ERC-1155 条件份额"],
       ["链层", "Polygon Amoy", "保存合约状态和交易日志，使用测试 POL 支付 gas"],
     ],
     [1600, 2800, 4400],
@@ -250,7 +253,7 @@ body.push(
     "  -> POST /api/orders 或 orders:seed:signed 写入 SQLite",
     "  -> 订单簿按 price_micros 聚合 BUY/SELL",
     "  -> matcher 发现 buy.price >= sell.price",
-    "  -> 调用 ResearchCLOBExchange.matchOrders(..., outcomeAmount)",
+    "  -> 调用 matchOrders(conditionId, taker, makers[], fillAmounts[], fees[])",
     "  -> Exchange 调用 DepositWallet.isValidSignature 验证签名",
     "  -> transferFrom 交换 rWALLET 与 YES",
     "  -> OrdersMatched 事件上链",
@@ -282,25 +285,25 @@ body.push(
 body.push(
   heading("4. 智能合约说明", 1),
   heading("4.1 ResearchDepositWallet", 2),
-  bullet("由 owner 控制，owner 可以通过 executeBatch 批量调用目标合约。"),
-  bullet("可以接收测试 POL，也可以持有 rWALLET 和 YES/NO。"),
-  bullet("实现 ERC-1271 isValidSignature，使 Exchange 能验证 owner 对钱包订单的签名。"),
+  bullet("由 Factory 通过 CREATE2 部署 ERC-1967 BeaconProxy，每个 owner 一个确定性地址。"),
+  bullet("支持官方公开 Batch 结构：wallet、nonce、deadline、calls，并支持 session signer。"),
+  bullet("实现 ERC-1271，并实现 ERC-1155 receiver 以持有 YES/NO。"),
   bullet("本项目的 Deposit Wallet 是研究版自建钱包，不是官方 Polymarket Deposit Wallet。"),
   heading("4.2 ResearchCLOBExchange", 2),
-  bullet("验证 BUY/SELL 订单方向、tokenId、过期时间、价格交叉和签名。"),
-  bullet("支持 matchOrders(buy, buySig, sell, sellSig) 全量成交。"),
-  bullet("支持 matchOrders(buy, buySig, sell, sellSig, outcomeAmount) 部分成交。"),
-  bullet("使用 filledMakerAmount 记录每个 orderHash 已成交 makerAmount。"),
-  bullet("支持 cancelOrder(order, cancelSignature)，链上写 cancelled[orderHash]。"),
+  bullet("订单字段和 EIP-712 域对齐 CTF Exchange V2 公开结构。"),
+  bullet("支持一个 taker 对多个 maker 的 matchOrders 入口。"),
+  bullet("支持 BUY/SELL 直接交换、BUY+BUY MINT、SELL+SELL MERGE。"),
+  bullet("使用 OrderStatus(filled, remaining) 记录剩余 maker amount。"),
+  bullet("cancelOrder 是本研究项目保留的扩展，并非官方 V2 同名生产接口。"),
   bullet("发出 OrdersMatched 和 OrderCancelled 事件，供同步器写入数据库。"),
   heading("4.3 ResearchWalletCoin 与 ResearchOutcomeToken", 2),
   bullet("ResearchWalletCoin/rWALLET 是 6 位小数测试抵押币。"),
-  bullet("ResearchOutcomeToken 是 ERC-1155-like 结果代币，当前 YES/NO tokenId 来自 MarketRegistry。"),
-  bullet("buyer Wallet 授权 Exchange 使用 rWALLET；seller Wallet 授权 Exchange 使用 YES/NO。"),
+  bullet("ResearchOutcomeToken 使用 ERC-1155 标准方法并实现 prepare/split/merge/resolve/redeem。"),
+  bullet("结果份额完全抵押，collateralizedSupply 用于检查抵押支持。"),
   heading("4.4 ResearchMarketRegistry", 2),
   bullet("保存 Market 数据：marketId、creator、question、yesTokenId、noTokenId、closeTime、status、winningOutcome。"),
   bullet("支持市场 OPEN/CLOSED/RESOLVED 生命周期事件。"),
-  bullet("早期 simulateTrade 仍可作为历史参考，但当前真实研究流程使用 ResearchCLOBExchange。"),
+  bullet("MarketRegistry 同时作为研究版 oracle adapter，resolve 后向 CTF 报告 payout。"),
 );
 
 body.push(
@@ -363,14 +366,18 @@ body.push(
   heading("7.1 Order 结构", 2),
   code([
     "Order {",
-    "  maker: address,        // 持有资产的钱包",
-    "  signer: address,       // 验签主体；本项目为 Deposit Wallet",
+    "  salt: uint256,",
+    "  maker: address,",
+    "  signer: address,",
     "  tokenId: uint256,      // YES/NO tokenId",
     "  makerAmount: uint256,  // BUY: 支付 rWALLET；SELL: 卖出 YES",
     "  takerAmount: uint256,  // BUY: 想买 YES；SELL: 想收 rWALLET",
     "  side: uint8,           // 0=BUY, 1=SELL",
-    "  expiration: uint256,",
-    "  salt: uint256",
+    "  signatureType: uint8,",
+    "  timestamp: uint256,",
+    "  metadata: bytes32,",
+    "  builder: bytes32,",
+    "  signature: bytes",
     "}",
   ]),
   heading("7.2 部分成交规则", 2),
@@ -381,7 +388,7 @@ body.push(
   bullet("成交后 SELL 的 filled_maker_amount 增加 outcomeAmount，filled_taker_amount 增加 collateralAmount。"),
   heading("7.3 链上取消规则", 2),
   bullet("取消签名使用 EIP-712 Cancel(orderHash)。"),
-  bullet("Exchange 验证 signer 对 Cancel 的签名后写 cancelled[orderHash]=true。"),
+  bullet("Exchange 验证 signer 对 Cancel 的签名后把 OrderStatus 标记为 filled。"),
   bullet("同步器读取 OrderCancelled 事件后，把数据库订单状态更新为 CANCELLED。"),
 );
 
@@ -406,8 +413,8 @@ body.push(
   bullet("链上写入动作必须设置 LIVE_ACTION 和 LIVE_CONFIRMATION=AMOY_TESTNET_ONLY。"),
   bullet("API 默认绑定 127.0.0.1，不应开放公网访问。"),
   bullet("当前后端会用本地私钥生成研究订单签名；真实系统应改为浏览器钱包签名，后端只接收 signed order。"),
-  bullet("ResearchOutcomeToken 只是 ERC-1155-like，不是完整 ERC-1155 标准实现。"),
-  bullet("Market 结算、赎回、预言机、费用、风控、批量撮合仍需继续研究实现。"),
+  bullet("研究 CTF 没有复制 Gnosis collectionId 椭圆曲线算法，positionId 是可读版确定性计算。"),
+  bullet("尚未实现官方 ERC-7739 包装、Safe 派生、Neg Risk、生产预言机和生产风控。"),
   bullet("所有合约未审计，不可用于主网资金。"),
   heading("9.1 与官方 Polymarket 的差异", 2),
   table(

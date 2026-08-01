@@ -11,13 +11,17 @@ const outputPath = path.join(
   "Polymarket_官方风格模拟项目架构与代码说明.docx",
 );
 const buildDir = fs.mkdtempSync(path.join(os.tmpdir(), "official-like-docx-"));
-const sourcePath = path.join(projectDir, "contracts", "ResearchPolymarketLike.sol");
-const scriptPath = path.join(projectDir, "scripts", "simulate-official-like-market.ts");
-const deploymentPath = path.join(
+const sourcePath = path.join(
   projectDir,
-  "deployments",
-  "research-official-like-amoy.json",
+  "contracts",
+  "research",
+  "ResearchPolymarketLike.sol",
 );
+const scriptPath = path.join(projectDir, "scripts", "simulate-official-like-market.ts");
+const v2DeploymentPath = path.join(projectDir, "deployments", "research-v2-amoy.json");
+const deploymentPath = fs.existsSync(v2DeploymentPath)
+  ? v2DeploymentPath
+  : path.join(projectDir, "deployments", "research-official-like-amoy.json");
 
 const source = fs.readFileSync(sourcePath, "utf8");
 const script = fs.readFileSync(scriptPath, "utf8");
@@ -286,7 +290,7 @@ body.push(
     ["文档项", "内容"],
     [
       ["项目目录", projectDir],
-      ["核心合约文件", "contracts/ResearchPolymarketLike.sol"],
+      ["核心合约文件", "contracts/research/ResearchPolymarketLike.sol"],
       ["核心脚本文件", "scripts/simulate-official-like-market.ts"],
       ["网络", "Polygon Amoy 测试网（chainId 80002）"],
       ["Owner / 支付 gas 钱包", deployment.owner],

@@ -86,12 +86,12 @@ function callout(title, text, fill = "FFF4CE", border = "D6B656") {
 const body = [];
 body.push(
   paragraph("Polymarket 研究版合约与官方合约对比说明", { style: "Title", align: "center", before: 1200, after: 240 }),
-  paragraph("ResearchPolymarketLike.sol 对照 Polymarket 官方 CLOB V2 / CTF / Deposit Wallet", { style: "Subtitle", align: "center", after: 500 }),
+  paragraph("contracts/research/ResearchPolymarketLike.sol 对照 Polymarket 官方 CLOB V2 / CTF / Deposit Wallet", { style: "Subtitle", align: "center", after: 500 }),
   table(
     ["文档项", "内容"],
     [
       ["项目路径", projectDir],
-      ["对比文件", "contracts/ResearchPolymarketLike.sol"],
+      ["对比文件", "contracts/research/ResearchPolymarketLike.sol"],
       ["本地数据库", dbPath],
       ["研究网络", "Polygon Amoy 测试网（chainId 80002）"],
       ["官方网络", "Polygon Mainnet（chainId 137）"],
